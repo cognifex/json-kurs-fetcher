@@ -161,8 +161,14 @@ def clean_description(html_fragment: str) -> str:
     else:
         container = fragment
 
-    for tag in container.find_all(["picture", "figure", "img", "source", "strong", "span", "h1", "h2", "h3", "header", "footer"]):
+    removable_tags = ("picture", "figure", "img", "source")
+    unwrap_tags = ("strong", "span", "h1", "h2", "h3", "header", "footer")
+
+    for tag in container.find_all(removable_tags):
         tag.decompose()
+
+    for tag in container.find_all(unwrap_tags):
+        tag.unwrap()
 
     for tag in list(container.find_all(True)):
         if not isinstance(tag, Tag):
