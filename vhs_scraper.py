@@ -139,8 +139,17 @@ def clean_description(html_fragment: str) -> str:
         tag.decompose()
 
     for tag in list(container.find_all(True)):
-        classes = {cls.lower() for cls in tag.get("class", [])}
-        identifier = " ".join(filter(None, [tag.get("id", "")] + sorted(classes)))
+        if not isinstance(tag, Tag):
+            continue
+
+        classes = {cls.lower() for cls in tag.get_attribute_list("class") if cls}
+        identifier_parts = []
+        element_id = tag.get("id")
+        if element_id:
+            identifier_parts.append(element_id.lower())
+        identifier_parts.extend(sorted(classes))
+        identifier = " ".join(identifier_parts)
+
         if any(keyword in identifier for keyword in REMOVABLE_CLASS_KEYWORDS):
             tag.decompose()
             continue
