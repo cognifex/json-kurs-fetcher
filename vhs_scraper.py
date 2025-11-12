@@ -1,512 +1,145 @@
 #!/usr/bin/env python3
-"""Scraper für VHS Lahnstein Kursdaten."""
-from __future__ import annotations
-
-import argparse
-import json
-import logging
+"""
+VHS-Lahnstein Scraper 3.1
+Ein kompakter, spezialisierter Scraper für vhs-lahnstein.de.
+Er erzeugt eine saubere JSON-Datei mit allen Kursen (inkl. Beschreibung, Bild, Zeit, Ort usw.)
+"""
 import re
-import sys
 import time
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+import json
+import argparse
+from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup
 
 BASE_URL = "https://vhs-lahnstein.de"
-DEFAULT_SEARCH_URL = (
-    "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe="
-    "Tim+Heimes&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1"
-)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; VHS-Scraper/3.0; +https://vhs-lahnstein.de)",
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-}
-REQUEST_DELAY = 1.0
-MAX_RETRIES = 3
-STOP_WORDS = ("zeiten", "ort", "preis", "bankverbindung", "iban")
-
-DESCRIPTION_SELECTORS = [
-    "div.VeranstaltungInhalt",
-    "div.VeranstaltungBeschreibung",
-    "div.textbereich",
-    "div.beschreibung",
-    "div.VeranstaltungTeaserInhalt",
-    "section.VeranstaltungInhalt",
-    "section.veranstaltungInhalt",
-    "section.veranstaltung-inhalt",
-    "div.cmxModuleContent",
-    "section.cmxModuleContent",
-    "[itemprop=description]",
-]
-
-DETAIL_LABELS = {
-    "nummer": "nummer",
-    "kursnummer": "nummer",
-    "kurs-nr": "nummer",
-    "kurs nr": "nummer",
-    "ort": "ort",
-    "raum": "ort",
-    "preis": "preis",
-    "entgelt": "preis",
-    "gebühr": "preis",
-    "leitung": "leitung",
-    "dozent": "leitung",
-    "dozentin": "leitung",
-    "referent": "leitung",
-    "referentin": "leitung",
-    "zeiten": "zeiten",
-    "termine": "zeiten",
-    "dauer": "zeiten",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; VHS-Scraper/3.1)"}
 
 
-@dataclass
-class Course:
-    guid: str
-    titel: str
-    beschreibung: str
-    bild: str
-    nummer: str
-    ort: str
-    preis: str
-    dozent: str
-    zeiten: str
-    link: str
+def fetch(url: str) -> str:
+    """HTML abrufen, mit kleinem Delay."""
+    time.sleep(1)
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.text
 
 
-def configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(message)s")
-
-
-def build_search_url(url: Optional[str], name: Optional[str]) -> str:
-    if url:
-        return url
-    if not name:
-        return DEFAULT_SEARCH_URL
-
-    parsed = urlparse(DEFAULT_SEARCH_URL)
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    query["Suchbegriffe"] = [name]
-    encoded = urlencode(query, doseq=True)
-    return urlunparse(parsed._replace(query=encoded))
-
-
-def fetch(session: requests.Session, url: str) -> Optional[str]:
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            logging.debug("Hole %s (Versuch %s/%s)", url, attempt, MAX_RETRIES)
-            response = session.get(url, headers=HEADERS, timeout=30)
-        except requests.RequestException as exc:  # pragma: no cover - Netzabhängig
-            logging.warning("Fehler beim Abrufen von %s: %s", url, exc)
-            time.sleep(REQUEST_DELAY)
-            continue
-
-        if response.status_code == 410:
-            logging.warning("Seite entfernt (410): %s", url)
-            time.sleep(REQUEST_DELAY)
-            return None
-
-        if response.ok:
-            time.sleep(REQUEST_DELAY)
-            return response.text
-
-        logging.warning("Unerwarteter Statuscode %s für %s", response.status_code, url)
-        time.sleep(REQUEST_DELAY)
-
-    logging.error("Dauerhafte Fehler beim Abrufen von %s", url)
-    return None
-
-
-def extract_course_links(html: str) -> List[str]:
+def get_course_links(overview_url: str) -> list[str]:
+    """Alle Kurslinks von der Übersichtsseite sammeln."""
+    html = fetch(overview_url)
     soup = BeautifulSoup(html, "html.parser")
-    pattern = re.compile(r"^/Veranstaltung/cmx[0-9a-f]+\.html$", re.IGNORECASE)
-    links: List[str] = []
-    seen = set()
-
-    for anchor in soup.find_all("a", href=pattern):
-        href = anchor.get("href")
-        if not href:
-            continue
-        absolute = urljoin(BASE_URL, href)
-        if absolute not in seen:
-            seen.add(absolute)
-            links.append(absolute)
-
-    return links
+    pattern = re.compile(r"^/Veranstaltung/cmx[0-9a-f]+\.html$")
+    links = [urljoin(BASE_URL, a["href"]) for a in soup.find_all("a", href=pattern)]
+    return sorted(set(links))
 
 
-REMOVABLE_CLASS_KEYWORDS = (
-    "zeit",
-    "term",
-    "ort",
-    "preis",
-    "bank",
-    "iban",
-    "konto",
-)
+def clean_html(html: str) -> str:
+    """HTML aufräumen, aber Formatierung (Absätze, Listen) erhalten."""
+    soup = BeautifulSoup(html, "html.parser")
 
+    # Entferne Bilder, figure/picture, leere Elemente
+    for t in soup(["img", "picture", "figure", "source", "script", "style"]):
+        t.decompose()
 
-def clean_description(html_fragment: str) -> str:
-    if not html_fragment:
-        return ""
-
-    fragment = BeautifulSoup(html_fragment, "html.parser")
-    container: Tag
-    if fragment.body:
-        container = fragment.body
-    else:
-        container = fragment
-
-    removable_tags = ("picture", "figure", "img", "source")
-    unwrap_tags = ("strong", "span", "h1", "h2", "h3", "header", "footer")
-
-    for tag in container.find_all(removable_tags):
-        tag.decompose()
-
-    for tag in container.find_all(unwrap_tags):
-        tag.unwrap()
-
-    for tag in list(container.find_all(True)):
-        if not isinstance(tag, Tag):
-            continue
-
-        attrs = tag.attrs or {}
-        class_attr = attrs.get("class", [])
-        if isinstance(class_attr, str):
-            class_values = [class_attr]
+    # Nur gewünschte Tags behalten
+    allowed = {"p", "ul", "ol", "li", "br", "a", "b", "strong", "em"}
+    for tag in soup.find_all(True):
+        if tag.name not in allowed:
+            tag.unwrap()
         else:
-            class_values = [cls for cls in class_attr if isinstance(cls, str)]
-        classes = {cls.lower() for cls in class_values}
+            tag.attrs = {k: v for k, v in tag.attrs.items() if k == "href"}
 
-        identifier_parts = []
-        element_id = attrs.get("id")
-        if isinstance(element_id, str) and element_id:
-            identifier_parts.append(element_id.lower())
-        identifier_parts.extend(sorted(classes))
-        identifier = " ".join(identifier_parts)
-
-        if any(keyword in identifier for keyword in REMOVABLE_CLASS_KEYWORDS):
-            tag.decompose()
-            continue
-
-    allowed = {"p", "ul", "ol", "li", "br", "a"}
-    for tag in list(container.find_all(True)):
-        if tag.name in allowed:
-            tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href"}}
-            continue
-        tag.unwrap()
-
-    for tag in container.find_all(["p", "li"]):
-        text = tag.get_text(" ", strip=True)
-        if not text:
-            tag.decompose()
-            continue
-        lowered = text.lower()
-        if any(keyword in lowered for keyword in STOP_WORDS):
-            tag.decompose()
-
-    children: List[str] = []
-    for child in container.children:
-        if isinstance(child, NavigableString):
-            text = str(child).strip()
-            if text:
-                children.append(text)
-        elif isinstance(child, Tag):
-            html = child.decode()
-            if html.strip():
-                children.append(html)
-
-    cleaned = "".join(children).strip()
-    cleaned = re.sub(r"\s*\n\s*", "\n", cleaned)
-
-    if not cleaned:
-        return ""
-
-    filtered_lines = []
-    for line in re.split(r"[\r\n]+", cleaned):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        lowered = stripped.lower()
-        if any(keyword in lowered for keyword in STOP_WORDS):
-            continue
-        filtered_lines.append(stripped)
-
-    return "\n".join(filtered_lines)
+    # Entferne Textzeilen, die mit Zeit/Ort/Preis anfangen
+    text = str(soup)
+    text = re.sub(r"(?i)(Zeiten?|Ort|Preis|Bankverbindung|IBAN).*", "", text)
+    return text.strip()
 
 
-def normalize_label(text: str) -> Optional[str]:
-    if not text:
-        return None
-    cleaned = text.strip().strip(":").lower()
-    if not cleaned:
-        return None
-    return DETAIL_LABELS.get(cleaned)
-
-
-def fold_detail_strings(strings: List[str]) -> Dict[str, str]:
-    details: Dict[str, str] = {}
-    cleaned_strings = [s.strip() for s in strings if s and s.strip()]
-    i = 0
-    while i < len(cleaned_strings):
-        label = normalize_label(cleaned_strings[i])
-        if not label:
-            i += 1
-            continue
-
-        values: List[str] = []
-        i += 1
-        while i < len(cleaned_strings):
-            potential_label = normalize_label(cleaned_strings[i])
-            if potential_label:
-                break
-            values.append(cleaned_strings[i])
-            i += 1
-
-        filtered_values = [segment for segment in values if segment not in {":", "-"}]
-        value_text = " ".join(filtered_values).strip()
-        if value_text and label not in details:
-            details[label] = value_text
-
-    return details
-
-
-def extract_details(soup: BeautifulSoup) -> Dict[str, str]:
-    details: Dict[str, str] = {}
-
-    detail_containers = soup.select(
-        "div.VeranstaltungTeaserDetails, div.detailBlock, div.veranstaltungDetails, "
-        "div.courseDetails, div.VeranstaltungTeaserMeta, section.courseDetails"
-    )
-
-    for container in detail_containers:
-        strings = list(container.stripped_strings)
-        folded = fold_detail_strings(strings)
-        for key, value in folded.items():
-            if key not in details and value:
-                details[key] = value
-
-    if not details:
-        fallback_text = soup.get_text("\n", strip=True)
-        fallback_matches = re.finditer(
-            r"(Nummer|Ort|Preis|Entgelt|Leitung|Dozent(?:in)?|Termine|Zeiten)\s*:?[\s\xa0]+([^\n]+)",
-            fallback_text,
-            flags=re.IGNORECASE,
-        )
-        for match in fallback_matches:
-            key = normalize_label(match.group(1))
-            if not key or key in details:
-                continue
-            details[key] = match.group(2).strip()
-
-    for dt in soup.find_all("dt"):
-        dd = dt.find_next("dd")
-        if not dd:
-            continue
-        key = normalize_label(dt.get_text(" ", strip=True))
-        value = dd.get_text(" ", strip=True)
-        if key and value and key not in details:
-            details[key] = value
-
-    return details
-
-
-def strip_bankinfo(value: str) -> str:
-    if not value:
-        return ""
-    cleaned = re.split(r"Bankverbindung|IBAN", value, flags=re.IGNORECASE)[0]
-    return cleaned.strip()
-
-
-def extract_image(soup: BeautifulSoup) -> str:
-    image = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.IGNORECASE))
-    if not image:
-        return ""
-    src = image.get("src", "").strip()
-    if not src:
-        return ""
-    if src.startswith("http"):
-        return src
-    return urljoin(BASE_URL, src)
-
-
-def extract_teacher(details: Dict[str, str], soup: BeautifulSoup) -> str:
-    if "leitung" in details:
-        return details["leitung"].strip()
-
-    text = soup.get_text(" ", strip=True)
-    match = re.search(r"Leitung\s*:?.{0,5}([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-\s]+)", text)
-    if match:
-        return match.group(1).strip()
-    return ""
-
-
-def extract_times(details: Dict[str, str], soup: BeautifulSoup) -> str:
-    for key in ("zeiten", "termine"):
-        if key in details and details[key]:
-            return unique_lines(details[key])
-
-    selectors = [
-        "div.VeranstaltungTeaserTermine",
-        "div.VeranstaltungTermine",
-        "div.termine",
-        "section.termine",
-    ]
-    for selector in selectors:
-        container = soup.select_one(selector)
-        if not container:
-            continue
-        text = container.get_text("\n", strip=True)
-        if text:
-            return unique_lines(text)
-    return ""
-
-
-def unique_lines(value: str) -> str:
-    lines = [line.strip() for line in re.split(r"[\r\n]+", value) if line.strip()]
-    seen: set[str] = set()
-    unique: List[str] = []
-    for line in lines:
-        normalized = re.sub(r"\s+", " ", line).strip().lower()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        unique.append(line)
-    return "\n".join(unique)
-
-
-def build_link(guid: str) -> str:
-    if not guid:
-        return ""
-    return f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{guid}"
-
-
-def extract_description(soup: BeautifulSoup) -> str:
-    for selector in DESCRIPTION_SELECTORS:
-        node = soup.select_one(selector)
-        if not node or not node.get_text(strip=True):
-            continue
-        cleaned = clean_description(node.decode_contents())
-        if cleaned:
-            return cleaned
-
-    fallback_selectors = [
-        "div.cmxModuleText",
-        "section.cmxModuleText",
-        "div.cmxModuleBeschreibung",
-        "div.veranstaltung-beschreibung",
-    ]
-    fragments: List[str] = []
-    for selector in fallback_selectors:
-        for node in soup.select(selector):
-            if not node or not node.get_text(strip=True):
-                continue
-            cleaned = clean_description(node.decode_contents())
-            if cleaned:
-                fragments.append(cleaned)
-    if fragments:
-        return "\n\n".join(dict.fromkeys(fragments))
-
-    article = soup.find("article")
-    if article and article.get_text(strip=True):
-        cleaned = clean_description(article.decode_contents())
-        if cleaned:
-            return cleaned
-
-    body = soup.body
-    if body and body.get_text(strip=True):
-        cleaned = clean_description(body.decode_contents())
-        if cleaned:
-            return cleaned
-
-    return ""
-
-
-def parse_course(session: requests.Session, url: str) -> Optional[Course]:
-    html = fetch(session, url)
-    if not html:
-        return None
-
+def parse_course(url: str) -> dict:
+    """Einzelnen Kurs extrahieren."""
+    html = fetch(url)
     soup = BeautifulSoup(html, "html.parser")
 
-    guid_match = re.search(r"(cmx[0-9a-f]+)\.html", url, re.IGNORECASE)
+    guid_match = re.search(r"(cmx[0-9a-f]+)\.html", url)
     guid = guid_match.group(1) if guid_match else ""
 
-    title_tag = soup.find("h1") or soup.find("h2")
-    title = title_tag.get_text(" ", strip=True) if title_tag else ""
+    titel = soup.find("h1")
+    titel = titel.get_text(strip=True) if titel else ""
 
-    description = extract_description(soup)
+    # Beschreibung
+    besch_node = soup.select_one(
+        "div.VeranstaltungTeaserInhalt, div.VeranstaltungTeaserText, div.cmxModuleText"
+    )
+    beschreibung = clean_html(besch_node.decode_contents()) if besch_node else ""
 
-    details = extract_details(soup)
-    nummer = details.get("nummer", "")
-    ort = details.get("ort", "")
-    preis = strip_bankinfo(details.get("preis", ""))
-    dozent = extract_teacher(details, soup)
-    zeiten = extract_times(details, soup)
-    bild = extract_image(soup)
-    link = build_link(guid)
+    # Details (Regex im Volltext)
+    text = soup.get_text(" ", strip=True)
 
-    logging.info("✔︎ %s", title or guid or url)
+    def find(pattern):
+        m = re.search(pattern, text, re.I)
+        return m.group(1).strip() if m else ""
 
-    return Course(
-        guid=guid,
-        titel=title,
-        beschreibung=description,
-        bild=bild,
-        nummer=nummer,
-        ort=ort,
-        preis=preis,
-        dozent=dozent,
-        zeiten=zeiten,
-        link=link,
+    nummer = find(r"Nummer\s*[:\-]?\s*([A-Z0-9\-]+)")
+    ort = find(r"Ort\s*[:\-]?\s*(.*?)\s+(?:Leitung|Preis|$)")
+    preis = find(r"Preis\s*[:\-]?\s*([0-9\.,]+(?:\s*€)?)")
+    dozent = find(r"Leitung\s*:?\s*([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-\s]+?)(?:,|Nummer|Ort|Preis|$)")
+
+    # Zeiten
+    term_div = soup.select_one(
+        "div.VeranstaltungTeaserTermine, div.VeranstaltungTermine, div.termine"
+    )
+    zeiten = (
+        re.sub(r"\s+", " ", term_div.get_text(" ", strip=True)) if term_div else ""
     )
 
+    # Bild
+    img = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
+    bild = urljoin(BASE_URL, img["src"]) if img and img.get("src") else ""
 
-def write_json(courses: Iterable[Course], output_path: str) -> None:
-    payload = [asdict(course) for course in courses]
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    # Anmeldelink
+    link = f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{guid}"
 
-
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scraper für vhs-lahnstein.de")
-    parser.add_argument("--url", help="Eigene Such-URL verwenden", default=None)
-    parser.add_argument("--name", help="Suchbegriff ersetzen (nur mit Standard-URL)", default=None)
-    parser.add_argument("--output", help="Ausgabedatei (Standard: kurse.json)", default="kurse.json")
-    parser.add_argument("--verbose", action="store_true", help="Ausführliche Logausgabe")
-    return parser.parse_args(argv)
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    configure_logging(args.verbose)
-
-    search_url = build_search_url(args.url, args.name)
-    logging.info("Lade Übersicht: %s", search_url)
-
-    session = requests.Session()
-    overview_html = fetch(session, search_url)
-    if not overview_html:
-        logging.error("Übersichtsseite konnte nicht geladen werden.")
-        return 1
-
-    course_links = extract_course_links(overview_html)
-    logging.info("Gefundene Kurslinks: %s", len(course_links))
-
-    courses: List[Course] = []
-    for link in course_links:
-        course = parse_course(session, link)
-        if course:
-            courses.append(course)
-
-    write_json(courses, args.output)
-    logging.info("%s Kurse gespeichert in %s", len(courses), args.output)
-    return 0
+    print(f"✔ {titel}")
+    return {
+        "guid": guid,
+        "titel": titel,
+        "beschreibung": beschreibung,
+        "bild": bild,
+        "nummer": nummer,
+        "ort": ort,
+        "preis": preis,
+        "dozent": dozent,
+        "zeiten": zeiten,
+        "link": link,
+    }
 
 
-if __name__ == "__main__":  # pragma: no cover - Skripteintritt
-    sys.exit(main())
+def main():
+    parser = argparse.ArgumentParser(description="VHS Lahnstein Kurs-Scraper 3.1")
+    parser.add_argument(
+        "--url",
+        default="https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes",
+        help="Übersichtsseite mit Kursen",
+    )
+    parser.add_argument("--output", default="kurse.json", help="JSON-Datei speichern unter …")
+    args = parser.parse_args()
+
+    links = get_course_links(args.url)
+    print(f"Gefundene Kurse: {len(links)}")
+
+    all_courses = []
+    for link in links:
+        try:
+            all_courses.append(parse_course(link))
+        except Exception as e:
+            print(f"⚠ Fehler bei {link}: {e}")
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(all_courses, f, ensure_ascii=False, indent=2)
+
+    print(f"{len(all_courses)} Kurse gespeichert in {args.output}")
+
+
+if __name__ == "__main__":
+    main()
