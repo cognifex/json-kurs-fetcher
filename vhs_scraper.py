@@ -113,6 +113,17 @@ def find_first(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[Tag]:
     return None
 
 
+REMOVABLE_CLASS_KEYWORDS = (
+    "zeit",
+    "term",
+    "ort",
+    "preis",
+    "bank",
+    "iban",
+    "konto",
+)
+
+
 def clean_description(html_fragment: str) -> str:
     if not html_fragment:
         return ""
@@ -126,6 +137,13 @@ def clean_description(html_fragment: str) -> str:
 
     for tag in container.find_all(["picture", "figure", "img", "source", "strong", "span", "h1", "h2", "h3", "header", "footer"]):
         tag.decompose()
+
+    for tag in list(container.find_all(True)):
+        classes = {cls.lower() for cls in tag.get("class", [])}
+        identifier = " ".join(filter(None, [tag.get("id", "")] + sorted(classes)))
+        if any(keyword in identifier for keyword in REMOVABLE_CLASS_KEYWORDS):
+            tag.decompose()
+            continue
 
     allowed = {"p", "ul", "ol", "li", "br", "a"}
     for tag in list(container.find_all(True)):
@@ -156,11 +174,30 @@ def clean_description(html_fragment: str) -> str:
 
     cleaned = "".join(children).strip()
     cleaned = re.sub(r"\s*\n\s*", "\n", cleaned)
-    return cleaned
+
+    if not cleaned:
+        return ""
+
+    filtered_lines = []
+    for line in re.split(r"[\r\n]+", cleaned):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(keyword in lowered for keyword in STOP_WORDS):
+            continue
+        filtered_lines.append(stripped)
+
+    return "\n".join(filtered_lines)
 
 
 def extract_details(soup: BeautifulSoup) -> Dict[str, str]:
     details: Dict[str, str] = {}
+    pattern = re.compile(
+        r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/]+):\s*(.*?)(?=(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/]+):|$)",
+        re.DOTALL,
+    )
+
     detail_selectors = [
         "div.VeranstaltungTeaserDetails div",
         "div.detailBlock div",
@@ -172,11 +209,19 @@ def extract_details(soup: BeautifulSoup) -> Dict[str, str]:
             text = div.get_text(" ", strip=True)
             if not text or ":" not in text:
                 continue
-            key, value = text.split(":", 1)
-            key = key.strip().lower()
-            value = value.strip()
-            if key and value and key not in details:
-                details[key] = value
+            matches = list(pattern.finditer(text))
+            if not matches:
+                key, value = text.split(":", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key and value and key not in details:
+                    details[key] = value
+                continue
+            for match in matches:
+                key = match.group(1).strip().lower()
+                value = re.sub(r"\s+", " ", match.group(2)).strip()
+                if key and value and key not in details:
+                    details[key] = value
 
     for dt in soup.find_all("dt"):
         dd = dt.find_next("dd")
@@ -276,12 +321,12 @@ def parse_course(session: requests.Session, url: str) -> Optional[Course]:
     description_container = find_first(
         soup,
         [
-            "div.VeranstaltungTeaserInhalt",
             "div.VeranstaltungInhalt",
             "div.VeranstaltungBeschreibung",
             "div.textbereich",
             "div.beschreibung",
             "article",
+            "div.VeranstaltungTeaserInhalt",
         ],
     )
     description_html = description_container.decode_contents() if description_container else ""
