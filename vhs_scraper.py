@@ -142,10 +142,17 @@ def clean_description(html_fragment: str) -> str:
         if not isinstance(tag, Tag):
             continue
 
-        classes = {cls.lower() for cls in tag.get_attribute_list("class") if cls}
+        attrs = tag.attrs or {}
+        class_attr = attrs.get("class", [])
+        if isinstance(class_attr, str):
+            class_values = [class_attr]
+        else:
+            class_values = [cls for cls in class_attr if isinstance(cls, str)]
+        classes = {cls.lower() for cls in class_values}
+
         identifier_parts = []
-        element_id = tag.get("id")
-        if element_id:
+        element_id = attrs.get("id")
+        if isinstance(element_id, str) and element_id:
             identifier_parts.append(element_id.lower())
         identifier_parts.extend(sorted(classes))
         identifier = " ".join(identifier_parts)
