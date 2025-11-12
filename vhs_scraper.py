@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-VHS-Lahnstein Scraper 3.1
-Ein kompakter, spezialisierter Scraper für vhs-lahnstein.de.
-Er erzeugt eine saubere JSON-Datei mit allen Kursen (inkl. Beschreibung, Bild, Zeit, Ort usw.)
+VHS-Lahnstein Scraper 3.2 – GitHub-Workflow-optimiert
+----------------------------------------------------
+Scraped alle Kurse von https://vhs-lahnstein.de für einen bestimmten Suchbegriff
+(z. B. "Tim Heimes") und schreibt sie in kurse.json.
+
+Optimierungen:
+- Browser-Mimikry (User-Agent, Referer)
+- Retry bei 403 / 5xx
+- kleine Vorschauausgabe bei leerem HTML (Debug)
 """
+
 import re
 import time
 import json
@@ -14,35 +21,68 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://vhs-lahnstein.de"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; VHS-Scraper/3.1)"}
+HEADERS = {
+    # Browser-Mimikry (Chrome unter Windows)
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/129.0 Safari/537.36"
+    ),
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    "Referer": "https://vhs-lahnstein.de/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+MAX_RETRIES = 3
+REQUEST_DELAY = 1.0
 
 
 def fetch(url: str) -> str:
-    """HTML abrufen, mit kleinem Delay."""
-    time.sleep(1)
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.text
+    """HTML mit Retry und Fake-Headers abrufen."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code == 403:
+                print(f"⚠ Zugriff blockiert (403) – Versuch {attempt}/{MAX_RETRIES}")
+                time.sleep(REQUEST_DELAY * 2)
+                continue
+            if r.status_code >= 500:
+                print(f"⚠ Serverfehler ({r.status_code}) – Retry {attempt}")
+                time.sleep(REQUEST_DELAY * 2)
+                continue
+            r.raise_for_status()
+            if not r.text.strip():
+                print("⚠ Leere Antwort erhalten.")
+            return r.text
+        except Exception as e:
+            print(f"⚠ Fehler bei {url}: {e}")
+            time.sleep(REQUEST_DELAY)
+    print(f"❌ Dauerhaft fehlgeschlagen: {url}")
+    return ""
 
 
 def get_course_links(overview_url: str) -> list[str]:
     """Alle Kurslinks von der Übersichtsseite sammeln."""
     html = fetch(overview_url)
+    if not html:
+        print("⚠ Übersicht leer – vermutlich blockiert.")
+        return []
+
     soup = BeautifulSoup(html, "html.parser")
     pattern = re.compile(r"^/Veranstaltung/cmx[0-9a-f]+\.html$")
     links = [urljoin(BASE_URL, a["href"]) for a in soup.find_all("a", href=pattern)]
+    print(f"Gefundene Kurslinks: {len(links)}")
+    if len(links) == 0:
+        print("🧾 HTML-Vorschau:", html[:500].replace("\n", " "))
     return sorted(set(links))
 
 
 def clean_html(html: str) -> str:
     """HTML aufräumen, aber Formatierung (Absätze, Listen) erhalten."""
     soup = BeautifulSoup(html, "html.parser")
-
-    # Entferne Bilder, figure/picture, leere Elemente
     for t in soup(["img", "picture", "figure", "source", "script", "style"]):
         t.decompose()
 
-    # Nur gewünschte Tags behalten
     allowed = {"p", "ul", "ol", "li", "br", "a", "b", "strong", "em"}
     for tag in soup.find_all(True):
         if tag.name not in allowed:
@@ -50,7 +90,6 @@ def clean_html(html: str) -> str:
         else:
             tag.attrs = {k: v for k, v in tag.attrs.items() if k == "href"}
 
-    # Entferne Textzeilen, die mit Zeit/Ort/Preis anfangen
     text = str(soup)
     text = re.sub(r"(?i)(Zeiten?|Ort|Preis|Bankverbindung|IBAN).*", "", text)
     return text.strip()
@@ -59,6 +98,9 @@ def clean_html(html: str) -> str:
 def parse_course(url: str) -> dict:
     """Einzelnen Kurs extrahieren."""
     html = fetch(url)
+    if not html:
+        return {}
+
     soup = BeautifulSoup(html, "html.parser")
 
     guid_match = re.search(r"(cmx[0-9a-f]+)\.html", url)
@@ -73,7 +115,7 @@ def parse_course(url: str) -> dict:
     )
     beschreibung = clean_html(besch_node.decode_contents()) if besch_node else ""
 
-    # Details (Regex im Volltext)
+    # Volltext
     text = soup.get_text(" ", strip=True)
 
     def find(pattern):
@@ -116,7 +158,7 @@ def parse_course(url: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VHS Lahnstein Kurs-Scraper 3.1")
+    parser = argparse.ArgumentParser(description="VHS Lahnstein Kurs-Scraper 3.2 (GitHub)")
     parser.add_argument(
         "--url",
         default="https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes",
@@ -126,19 +168,20 @@ def main():
     args = parser.parse_args()
 
     links = get_course_links(args.url)
-    print(f"Gefundene Kurse: {len(links)}")
-
     all_courses = []
+
     for link in links:
         try:
-            all_courses.append(parse_course(link))
+            course = parse_course(link)
+            if course:
+                all_courses.append(course)
         except Exception as e:
             print(f"⚠ Fehler bei {link}: {e}")
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(all_courses, f, ensure_ascii=False, indent=2)
 
-    print(f"{len(all_courses)} Kurse gespeichert in {args.output}")
+    print(f"💾 {len(all_courses)} Kurse gespeichert in {args.output}")
 
 
 if __name__ == "__main__":
