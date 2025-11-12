@@ -1,150 +1,412 @@
 #!/usr/bin/env python3
-import requests, json, re, time
-from bs4 import BeautifulSoup
+"""Scraper für VHS Lahnstein Kursdaten."""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+import time
+from dataclasses import dataclass, asdict
+from typing import Dict, Iterable, List, Optional
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 BASE_URL = "https://vhs-lahnstein.de"
-SEARCH_URL = "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; VHS-Scraper/2.1)"}
+DEFAULT_SEARCH_URL = (
+    "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe="
+    "Tim+Heimes&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1"
+)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; VHS-Scraper/3.0; +https://vhs-lahnstein.de)",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+}
+REQUEST_DELAY = 1.0
+MAX_RETRIES = 3
+STOP_WORDS = ("zeiten", "ort", "preis", "bankverbindung", "iban")
 
 
-def fetch(url):
-    """Lädt HTML mit Retry"""
-    for _ in range(3):
+@dataclass
+class Course:
+    guid: str
+    titel: str
+    beschreibung: str
+    bild: str
+    nummer: str
+    ort: str
+    preis: str
+    dozent: str
+    zeiten: str
+    link: str
+
+
+def configure_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(message)s")
+
+
+def build_search_url(url: Optional[str], name: Optional[str]) -> str:
+    if url:
+        return url
+    if not name:
+        return DEFAULT_SEARCH_URL
+
+    parsed = urlparse(DEFAULT_SEARCH_URL)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query["Suchbegriffe"] = [name]
+    encoded = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=encoded))
+
+
+def fetch(session: requests.Session, url: str) -> Optional[str]:
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            if r.status_code == 200:
-                return r.text
-            elif r.status_code == 410:
-                print(f"⚠️  Seite entfernt: {url}")
-                return None
-        except Exception as e:
-            print(f"Fehler bei Abruf {url}: {e}")
-            time.sleep(1)
+            logging.debug("Hole %s (Versuch %s/%s)", url, attempt, MAX_RETRIES)
+            response = session.get(url, headers=HEADERS, timeout=30)
+        except requests.RequestException as exc:  # pragma: no cover - Netzabhängig
+            logging.warning("Fehler beim Abrufen von %s: %s", url, exc)
+            time.sleep(REQUEST_DELAY)
+            continue
+
+        if response.status_code == 410:
+            logging.warning("Seite entfernt (410): %s", url)
+            time.sleep(REQUEST_DELAY)
+            return None
+
+        if response.ok:
+            time.sleep(REQUEST_DELAY)
+            return response.text
+
+        logging.warning("Unerwarteter Statuscode %s für %s", response.status_code, url)
+        time.sleep(REQUEST_DELAY)
+
+    logging.error("Dauerhafte Fehler beim Abrufen von %s", url)
     return None
 
 
-def extract_course_links(html):
-    """Alle Kurslinks von der Übersicht"""
+def extract_course_links(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.select("a[href*='/Veranstaltung/cmx']"):
-        href = a.get("href")
-        if href and href.startswith("/Veranstaltung/cmx") and href.endswith(".html"):
-            links.append(BASE_URL + href)
-    return list(set(links))
+    pattern = re.compile(r"^/Veranstaltung/cmx[0-9a-f]+\.html$", re.IGNORECASE)
+    links: List[str] = []
+    seen = set()
+
+    for anchor in soup.find_all("a", href=pattern):
+        href = anchor.get("href")
+        if not href:
+            continue
+        absolute = urljoin(BASE_URL, href)
+        if absolute not in seen:
+            seen.add(absolute)
+            links.append(absolute)
+
+    return links
 
 
-def clean_html_fragment(html):
-    """Entfernt Kopfzeilen, Bilder, Figures etc. und säubert kaputte Tags"""
-    soup = BeautifulSoup(html, "html.parser")
+def find_first(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[Tag]:
+    for selector in selectors:
+        tag = soup.select_one(selector)
+        if tag and tag.get_text(strip=True):
+            return tag
+    return None
 
-    # Unerwünschte Tags entfernen
-    for tag in soup.find_all(["picture", "img", "source", "strong", "h1", "figure"]):
+
+REMOVABLE_CLASS_KEYWORDS = (
+    "zeit",
+    "term",
+    "ort",
+    "preis",
+    "bank",
+    "iban",
+    "konto",
+)
+
+
+def clean_description(html_fragment: str) -> str:
+    if not html_fragment:
+        return ""
+
+    fragment = BeautifulSoup(html_fragment, "html.parser")
+    container: Tag
+    if fragment.body:
+        container = fragment.body
+    else:
+        container = fragment
+
+    for tag in container.find_all(["picture", "figure", "img", "source", "strong", "span", "h1", "h2", "h3", "header", "footer"]):
         tag.decompose()
 
-    # Leere Container löschen
-    for div in soup.find_all("div"):
-        if not div.get_text(strip=True):
-            div.decompose()
+    for tag in list(container.find_all(True)):
+        if not isinstance(tag, Tag):
+            continue
 
-    # Überflüssige span-Tags entfernen
-    for span in soup.find_all("span"):
-        span.unwrap()
+        classes = {cls.lower() for cls in tag.get_attribute_list("class") if cls}
+        identifier_parts = []
+        element_id = tag.get("id")
+        if element_id:
+            identifier_parts.append(element_id.lower())
+        identifier_parts.extend(sorted(classes))
+        identifier = " ".join(identifier_parts)
 
-    return str(soup).strip()
+        if any(keyword in identifier for keyword in REMOVABLE_CLASS_KEYWORDS):
+            tag.decompose()
+            continue
+
+    allowed = {"p", "ul", "ol", "li", "br", "a"}
+    for tag in list(container.find_all(True)):
+        if tag.name in allowed:
+            tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href"}}
+            continue
+        tag.unwrap()
+
+    for tag in container.find_all(["p", "li"]):
+        text = tag.get_text(" ", strip=True)
+        if not text:
+            tag.decompose()
+            continue
+        lowered = text.lower()
+        if any(keyword in lowered for keyword in STOP_WORDS):
+            tag.decompose()
+
+    children: List[str] = []
+    for child in container.children:
+        if isinstance(child, NavigableString):
+            text = str(child).strip()
+            if text:
+                children.append(text)
+        elif isinstance(child, Tag):
+            html = child.decode()
+            if html.strip():
+                children.append(html)
+
+    cleaned = "".join(children).strip()
+    cleaned = re.sub(r"\s*\n\s*", "\n", cleaned)
+
+    if not cleaned:
+        return ""
+
+    filtered_lines = []
+    for line in re.split(r"[\r\n]+", cleaned):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(keyword in lowered for keyword in STOP_WORDS):
+            continue
+        filtered_lines.append(stripped)
+
+    return "\n".join(filtered_lines)
 
 
-def parse_course(url):
-    """Parst eine Kursdetailseite"""
-    html = fetch(url)
+def extract_details(soup: BeautifulSoup) -> Dict[str, str]:
+    details: Dict[str, str] = {}
+    pattern = re.compile(
+        r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/]+):\s*(.*?)(?=(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/]+):|$)",
+        re.DOTALL,
+    )
+
+    detail_selectors = [
+        "div.VeranstaltungTeaserDetails div",
+        "div.detailBlock div",
+        "div.veranstaltungDetails div",
+        "div.courseDetails div",
+    ]
+    for selector in detail_selectors:
+        for div in soup.select(selector):
+            text = div.get_text(" ", strip=True)
+            if not text or ":" not in text:
+                continue
+            matches = list(pattern.finditer(text))
+            if not matches:
+                key, value = text.split(":", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key and value and key not in details:
+                    details[key] = value
+                continue
+            for match in matches:
+                key = match.group(1).strip().lower()
+                value = re.sub(r"\s+", " ", match.group(2)).strip()
+                if key and value and key not in details:
+                    details[key] = value
+
+    for dt in soup.find_all("dt"):
+        dd = dt.find_next("dd")
+        if not dd:
+            continue
+        key = dt.get_text(" ", strip=True).strip(":").lower()
+        value = dd.get_text(" ", strip=True)
+        if key and value and key not in details:
+            details[key] = value
+
+    return details
+
+
+def strip_bankinfo(value: str) -> str:
+    if not value:
+        return ""
+    cleaned = re.split(r"Bankverbindung|IBAN", value, flags=re.IGNORECASE)[0]
+    return cleaned.strip()
+
+
+def extract_image(soup: BeautifulSoup) -> str:
+    image = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.IGNORECASE))
+    if not image:
+        return ""
+    src = image.get("src", "").strip()
+    if not src:
+        return ""
+    if src.startswith("http"):
+        return src
+    return urljoin(BASE_URL, src)
+
+
+def extract_teacher(details: Dict[str, str], soup: BeautifulSoup) -> str:
+    if "leitung" in details:
+        return details["leitung"].strip()
+
+    text = soup.get_text(" ", strip=True)
+    match = re.search(r"Leitung\s*:?.{0,5}([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-\s]+)", text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def extract_times(details: Dict[str, str], soup: BeautifulSoup) -> str:
+    for key in ("zeiten", "termine"):
+        if key in details and details[key]:
+            return unique_lines(details[key])
+
+    selectors = [
+        "div.VeranstaltungTeaserTermine",
+        "div.VeranstaltungTermine",
+        "div.termine",
+        "section.termine",
+    ]
+    for selector in selectors:
+        container = soup.select_one(selector)
+        if not container:
+            continue
+        text = container.get_text("\n", strip=True)
+        if text:
+            return unique_lines(text)
+    return ""
+
+
+def unique_lines(value: str) -> str:
+    lines = [line.strip() for line in re.split(r"[\r\n]+", value) if line.strip()]
+    seen: set[str] = set()
+    unique: List[str] = []
+    for line in lines:
+        normalized = re.sub(r"\s+", " ", line).strip().lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(line)
+    return "\n".join(unique)
+
+
+def build_link(guid: str) -> str:
+    if not guid:
+        return ""
+    return f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{guid}"
+
+
+def parse_course(session: requests.Session, url: str) -> Optional[Course]:
+    html = fetch(session, url)
     if not html:
         return None
 
     soup = BeautifulSoup(html, "html.parser")
-    kurs = {}
 
-    # GUID aus URL
-    m = re.search(r"cmx([a-z0-9]+)\.html", url)
-    kurs["guid"] = f"cmx{m.group(1)}" if m else ""
+    guid_match = re.search(r"(cmx[0-9a-f]+)\.html", url, re.IGNORECASE)
+    guid = guid_match.group(1) if guid_match else ""
 
-    # Titel
-    title_tag = soup.find(["h1", "h2"])
-    kurs["titel"] = title_tag.get_text(strip=True) if title_tag else "Ohne Titel"
+    title_tag = soup.find("h1") or soup.find("h2")
+    title = title_tag.get_text(" ", strip=True) if title_tag else ""
 
-    # Beschreibung (gezielt & Fallback)
-    desc_tag = soup.select_one(
-        "div.VeranstaltungTeaserInhalt, div.VeranstaltungInhalt, div.textbereich, div.beschreibung"
+    description_container = find_first(
+        soup,
+        [
+            "div.VeranstaltungInhalt",
+            "div.VeranstaltungBeschreibung",
+            "div.textbereich",
+            "div.beschreibung",
+            "article",
+            "div.VeranstaltungTeaserInhalt",
+        ],
     )
-    if not desc_tag:
-        candidates = [d for d in soup.find_all("div") if len(d.get_text(strip=True)) > 300]
-        desc_tag = max(candidates, key=lambda d: len(d.get_text(strip=True)), default=None)
+    description_html = description_container.decode_contents() if description_container else ""
+    description = clean_description(description_html)
 
-    beschreibung = clean_html_fragment(desc_tag.decode_contents()) if desc_tag else ""
-    beschreibung = re.sub(r"(Zeiten|Leitung|Nummer|Ort|Preis|Bankverbindung).*", "", beschreibung, flags=re.DOTALL)
-    kurs["beschreibung"] = beschreibung.strip()
+    details = extract_details(soup)
+    nummer = details.get("nummer", "")
+    ort = details.get("ort", "")
+    preis = strip_bankinfo(details.get("preis", ""))
+    dozent = extract_teacher(details, soup)
+    zeiten = extract_times(details, soup)
+    bild = extract_image(soup)
+    link = build_link(guid)
 
-    # Kursbild
-    bild_tag = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/"))
-    if bild_tag:
-        src = bild_tag.get("src")
-        kurs["bild"] = src if src.startswith("http") else BASE_URL + src
-    else:
-        kurs["bild"] = ""
+    logging.info("✔︎ %s", title or guid or url)
 
-    # Details (Nummer, Ort, Preis) aus strukturiertem Block
-    details = {}
-    for div in soup.select("div.VeranstaltungTeaserDetails div"):
-        txt = div.get_text(" ", strip=True)
-        if ":" in txt:
-            k, v = txt.split(":", 1)
-            details[k.strip().lower()] = v.strip()
-
-    def strip_bankinfo(s: str) -> str:
-        return re.split(r"Bankverbindung", s)[0].strip()
-
-    kurs["nummer"] = details.get("nummer", "")
-    kurs["ort"] = details.get("ort", "")
-    kurs["preis"] = strip_bankinfo(details.get("preis", ""))
-
-    # Dozent und Zeiten (aus Text)
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"Leitung\s*:?\s*([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s\-]+)", text)
-    kurs["dozent"] = m.group(1).strip() if m else ""
-
-    m = re.search(r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?= Preis|Leitung|Nummer|Ort|$)", text)
-    kurs["zeiten"] = m.group(1).strip() if m else ""
-
-    # Anmeldelink
-    m = re.search(r"f_veranstaltung-(cmx[0-9a-f]+)", html)
-    guid = m.group(1) if m else kurs["guid"]
-    kurs["link"] = f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{guid}"
-
-    print(f"✅ {kurs['titel']}")
-    return kurs
+    return Course(
+        guid=guid,
+        titel=title,
+        beschreibung=description,
+        bild=bild,
+        nummer=nummer,
+        ort=ort,
+        preis=preis,
+        dozent=dozent,
+        zeiten=zeiten,
+        link=link,
+    )
 
 
-def main():
-    print(f"🔎 Lade Übersicht: {SEARCH_URL}")
-    html = fetch(SEARCH_URL)
-    if not html:
-        print("❌ Übersicht nicht abrufbar.")
-        return
-
-    kurs_links = extract_course_links(html)
-    print(f"Gefundene Kurse: {len(kurs_links)}")
-
-    result = []
-    for link in kurs_links:
-        kurs = parse_course(link)
-        if kurs:
-            result.append(kurs)
-        time.sleep(1.5)
-
-    with open("kurse.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    print(f"\n💾 {len(result)} Kurse gespeichert in 'kurse.json'.")
+def write_json(courses: Iterable[Course], output_path: str) -> None:
+    payload = [asdict(course) for course in courses]
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
-if __name__ == "__main__":
-    main()
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Scraper für vhs-lahnstein.de")
+    parser.add_argument("--url", help="Eigene Such-URL verwenden", default=None)
+    parser.add_argument("--name", help="Suchbegriff ersetzen (nur mit Standard-URL)", default=None)
+    parser.add_argument("--output", help="Ausgabedatei (Standard: kurse.json)", default="kurse.json")
+    parser.add_argument("--verbose", action="store_true", help="Ausführliche Logausgabe")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    configure_logging(args.verbose)
+
+    search_url = build_search_url(args.url, args.name)
+    logging.info("Lade Übersicht: %s", search_url)
+
+    session = requests.Session()
+    overview_html = fetch(session, search_url)
+    if not overview_html:
+        logging.error("Übersichtsseite konnte nicht geladen werden.")
+        return 1
+
+    course_links = extract_course_links(overview_html)
+    logging.info("Gefundene Kurslinks: %s", len(course_links))
+
+    courses: List[Course] = []
+    for link in course_links:
+        course = parse_course(session, link)
+        if course:
+            courses.append(course)
+
+    write_json(courses, args.output)
+    logging.info("%s Kurse gespeichert in %s", len(courses), args.output)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - Skripteintritt
+    sys.exit(main())
