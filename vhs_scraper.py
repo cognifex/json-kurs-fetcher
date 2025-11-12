@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -27,6 +27,40 @@ HEADERS = {
 REQUEST_DELAY = 1.0
 MAX_RETRIES = 3
 STOP_WORDS = ("zeiten", "ort", "preis", "bankverbindung", "iban")
+
+DESCRIPTION_SELECTORS = [
+    "div.VeranstaltungInhalt",
+    "div.VeranstaltungBeschreibung",
+    "div.textbereich",
+    "div.beschreibung",
+    "div.VeranstaltungTeaserInhalt",
+    "section.VeranstaltungInhalt",
+    "section.veranstaltungInhalt",
+    "section.veranstaltung-inhalt",
+    "div.cmxModuleContent",
+    "section.cmxModuleContent",
+    "[itemprop=description]",
+]
+
+DETAIL_LABELS = {
+    "nummer": "nummer",
+    "kursnummer": "nummer",
+    "kurs-nr": "nummer",
+    "kurs nr": "nummer",
+    "ort": "ort",
+    "raum": "ort",
+    "preis": "preis",
+    "entgelt": "preis",
+    "gebühr": "preis",
+    "leitung": "leitung",
+    "dozent": "leitung",
+    "dozentin": "leitung",
+    "referent": "leitung",
+    "referentin": "leitung",
+    "zeiten": "zeiten",
+    "termine": "zeiten",
+    "dauer": "zeiten",
+}
 
 
 @dataclass
@@ -103,14 +137,6 @@ def extract_course_links(html: str) -> List[str]:
             links.append(absolute)
 
     return links
-
-
-def find_first(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[Tag]:
-    for selector in selectors:
-        tag = soup.select_one(selector)
-        if tag and tag.get_text(strip=True):
-            return tag
-    return None
 
 
 REMOVABLE_CLASS_KEYWORDS = (
@@ -207,43 +233,75 @@ def clean_description(html_fragment: str) -> str:
     return "\n".join(filtered_lines)
 
 
+def normalize_label(text: str) -> Optional[str]:
+    if not text:
+        return None
+    cleaned = text.strip().strip(":").lower()
+    if not cleaned:
+        return None
+    return DETAIL_LABELS.get(cleaned)
+
+
+def fold_detail_strings(strings: List[str]) -> Dict[str, str]:
+    details: Dict[str, str] = {}
+    cleaned_strings = [s.strip() for s in strings if s and s.strip()]
+    i = 0
+    while i < len(cleaned_strings):
+        label = normalize_label(cleaned_strings[i])
+        if not label:
+            i += 1
+            continue
+
+        values: List[str] = []
+        i += 1
+        while i < len(cleaned_strings):
+            potential_label = normalize_label(cleaned_strings[i])
+            if potential_label:
+                break
+            values.append(cleaned_strings[i])
+            i += 1
+
+        filtered_values = [segment for segment in values if segment not in {":", "-"}]
+        value_text = " ".join(filtered_values).strip()
+        if value_text and label not in details:
+            details[label] = value_text
+
+    return details
+
+
 def extract_details(soup: BeautifulSoup) -> Dict[str, str]:
     details: Dict[str, str] = {}
-    pattern = re.compile(
-        r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/]+):\s*(.*?)(?=(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/]+):|$)",
-        re.DOTALL,
+
+    detail_containers = soup.select(
+        "div.VeranstaltungTeaserDetails, div.detailBlock, div.veranstaltungDetails, "
+        "div.courseDetails, div.VeranstaltungTeaserMeta, section.courseDetails"
     )
 
-    detail_selectors = [
-        "div.VeranstaltungTeaserDetails div",
-        "div.detailBlock div",
-        "div.veranstaltungDetails div",
-        "div.courseDetails div",
-    ]
-    for selector in detail_selectors:
-        for div in soup.select(selector):
-            text = div.get_text(" ", strip=True)
-            if not text or ":" not in text:
+    for container in detail_containers:
+        strings = list(container.stripped_strings)
+        folded = fold_detail_strings(strings)
+        for key, value in folded.items():
+            if key not in details and value:
+                details[key] = value
+
+    if not details:
+        fallback_text = soup.get_text("\n", strip=True)
+        fallback_matches = re.finditer(
+            r"(Nummer|Ort|Preis|Entgelt|Leitung|Dozent(?:in)?|Termine|Zeiten)\s*:?[\s\xa0]+([^\n]+)",
+            fallback_text,
+            flags=re.IGNORECASE,
+        )
+        for match in fallback_matches:
+            key = normalize_label(match.group(1))
+            if not key or key in details:
                 continue
-            matches = list(pattern.finditer(text))
-            if not matches:
-                key, value = text.split(":", 1)
-                key = key.strip().lower()
-                value = value.strip()
-                if key and value and key not in details:
-                    details[key] = value
-                continue
-            for match in matches:
-                key = match.group(1).strip().lower()
-                value = re.sub(r"\s+", " ", match.group(2)).strip()
-                if key and value and key not in details:
-                    details[key] = value
+            details[key] = match.group(2).strip()
 
     for dt in soup.find_all("dt"):
         dd = dt.find_next("dd")
         if not dd:
             continue
-        key = dt.get_text(" ", strip=True).strip(":").lower()
+        key = normalize_label(dt.get_text(" ", strip=True))
         value = dd.get_text(" ", strip=True)
         if key and value and key not in details:
             details[key] = value
@@ -321,6 +379,47 @@ def build_link(guid: str) -> str:
     return f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{guid}"
 
 
+def extract_description(soup: BeautifulSoup) -> str:
+    for selector in DESCRIPTION_SELECTORS:
+        node = soup.select_one(selector)
+        if not node or not node.get_text(strip=True):
+            continue
+        cleaned = clean_description(node.decode_contents())
+        if cleaned:
+            return cleaned
+
+    fallback_selectors = [
+        "div.cmxModuleText",
+        "section.cmxModuleText",
+        "div.cmxModuleBeschreibung",
+        "div.veranstaltung-beschreibung",
+    ]
+    fragments: List[str] = []
+    for selector in fallback_selectors:
+        for node in soup.select(selector):
+            if not node or not node.get_text(strip=True):
+                continue
+            cleaned = clean_description(node.decode_contents())
+            if cleaned:
+                fragments.append(cleaned)
+    if fragments:
+        return "\n\n".join(dict.fromkeys(fragments))
+
+    article = soup.find("article")
+    if article and article.get_text(strip=True):
+        cleaned = clean_description(article.decode_contents())
+        if cleaned:
+            return cleaned
+
+    body = soup.body
+    if body and body.get_text(strip=True):
+        cleaned = clean_description(body.decode_contents())
+        if cleaned:
+            return cleaned
+
+    return ""
+
+
 def parse_course(session: requests.Session, url: str) -> Optional[Course]:
     html = fetch(session, url)
     if not html:
@@ -334,19 +433,7 @@ def parse_course(session: requests.Session, url: str) -> Optional[Course]:
     title_tag = soup.find("h1") or soup.find("h2")
     title = title_tag.get_text(" ", strip=True) if title_tag else ""
 
-    description_container = find_first(
-        soup,
-        [
-            "div.VeranstaltungInhalt",
-            "div.VeranstaltungBeschreibung",
-            "div.textbereich",
-            "div.beschreibung",
-            "article",
-            "div.VeranstaltungTeaserInhalt",
-        ],
-    )
-    description_html = description_container.decode_contents() if description_container else ""
-    description = clean_description(description_html)
+    description = extract_description(soup)
 
     details = extract_details(soup)
     nummer = details.get("nummer", "")
