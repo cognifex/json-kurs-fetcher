@@ -319,6 +319,17 @@ function vhs_normalize_json_url($url) {
                 return $normalized;
             }
         }
+        $body = wp_remote_retrieve_body($response);
+    } else {
+        if (!is_readable($json_source)) {
+            return new WP_Error('vhs_file_error', 'Die ausgewählte Datei kann nicht gelesen werden.');
+        }
+        $body = file_get_contents($json_source);
+    }
+
+    $data = json_decode($body, true);
+    if (!is_array($data)) {
+        return new WP_Error('vhs_invalid_json', 'Die JSON-Daten konnten nicht verarbeitet werden.');
     }
 
     return $url;
