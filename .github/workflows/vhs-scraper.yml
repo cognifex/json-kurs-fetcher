@@ -3,7 +3,7 @@ name: VHS Lahnstein Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 5 * * *' # Jeden Tag um 05:00 UTC (06:00 MEZ)
+    - cron: '0 5 * * *' # Jeden Tag um 05:00 UTC
 
 permissions:
   contents: write
@@ -12,11 +12,12 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: false  # wir setzen eigene GITHUB_TOKEN Auth
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,19 +27,45 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || echo "Keine requirements.txt vorhanden – überspringe."
+          pip install -r requirements.txt || echo "Keine requirements.txt – überspringe."
 
-      - name: Run scraper
+      - name: Run scraper (normal)
+        id: run1
         run: |
-          echo "Starte VHS-Scraper..."
-          python vhs_scraper.py --output kurse.json || (echo "⚠ Fehler, versuche erneut..." && sleep 5 && python vhs_scraper.py --output kurse.json)
+          echo "Starte VHS-Scraper (normal)..."
+          python vhs_scraper.py --output kurse.json || true
 
-      - name: Prüfe JSON-Inhalt
+      - name: Prüfe Ergebnis nach Run 1
+        id: check1
         run: |
           if [ ! -s kurse.json ]; then
-            echo "❌ JSON leer – Abbruch."
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run scraper (DEBUG, falls nötig)
+        if: steps.check1.outputs.empty == 'true'
+        id: run2
+        run: |
+          echo "⚠ Erstes Ergebnis leer – starte Debug-Modus..."
+          python vhs_scraper.py --debug --output kurse.json || true
+
+      - name: Upload Debug Artifacts (HTML + Logs)
+        if: steps.check1.outputs.empty == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vhs-debug-artifacts
+          path: debug
+          if-no-files-found: warn
+
+      - name: Prüfe JSON erneut (auch nach Debug)
+        run: |
+          if [ ! -s kurse.json ]; then
+            echo "❌ JSON weiterhin leer – Abbruch."
             exit 1
           fi
+          echo "Vorschau auf kurse.json:"
           head -n 20 kurse.json
 
       - name: Commit and push changes
