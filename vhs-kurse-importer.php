@@ -558,6 +558,15 @@ function vhs_parse_times_value($value) {
     return [$summary, $heading, $details];
 }
 
+function vhs_prettify_summary_line($line) {
+    $line = trim((string) $line);
+    if ($line === '') {
+        return '';
+    }
+
+    return preg_replace('/,\s+/', ' · ', $line);
+}
+
 function vhs_format_times_html($value) {
     [$summary, $heading, $details] = vhs_parse_times_value($value);
 
@@ -568,11 +577,15 @@ function vhs_format_times_html($value) {
     $html = '<div class="vhs-times">';
 
     if (!empty($summary)) {
-        $html .= '<ul class="vhs-times-summary">';
+        $html .= '<div class="vhs-times-summary-grid">';
         foreach ($summary as $line) {
-            $html .= '<li>' . esc_html($line) . '</li>';
+            $text = vhs_prettify_summary_line($line);
+            if ($text === '') {
+                continue;
+            }
+            $html .= '<div class="vhs-times-summary-item">' . esc_html($text) . '</div>';
         }
-        $html .= '</ul>';
+        $html .= '</div>';
     }
 
     if (!empty($heading)) {
@@ -580,12 +593,13 @@ function vhs_format_times_html($value) {
     }
 
     if (!empty($details)) {
-        $html .= '<ul class="vhs-times-details">';
+        $html .= '<ul class="vhs-times-list">';
         foreach ($details as $line) {
+            $line = trim($line);
             if ($line === '') {
                 continue;
             }
-            $html .= '<li>' . esc_html($line) . '</li>';
+            $html .= '<li class="vhs-times-list-item"><span class="vhs-times-list-text">' . esc_html($line) . '</span></li>';
         }
         $html .= '</ul>';
     }
@@ -651,20 +665,21 @@ add_action('wp_enqueue_scripts', function() {
 .vhs-field strong{min-width:6.5rem;display:inline-block;font-weight:600;color:var(--ct-primary,#333);}
 .vhs-field-times{margin:0.9rem 0 0.8rem;}
 .vhs-field-times strong{display:block;margin-bottom:0.4rem;min-width:auto;}
-.vhs-times-content{display:flex;flex-direction:column;gap:0.6rem;}
-.vhs-times-summary,.vhs-times-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0.4rem;padding:0;margin:0;list-style:none;font-size:0.9rem;}
-.vhs-times-summary li,.vhs-times-summary-item{border:1px solid rgba(0,0,0,0.08);border-radius:10px;padding:0.45rem 0.75rem;background:var(--ct-background-light,#f8f9fa);line-height:1.35;}
-.vhs-times-heading{font-weight:600;color:var(--ct-primary,#333);font-size:0.92rem;}
-.vhs-times-table-wrapper{border:1px solid rgba(0,0,0,0.08);border-radius:12px;overflow:hidden;}
-.vhs-times-table{width:100%;border-collapse:collapse;font-size:0.9rem;}
-.vhs-times-table td{padding:0.6rem 0.8rem;vertical-align:top;border-top:1px solid rgba(0,0,0,0.05);}
-.vhs-times-table tr:first-child td{border-top:none;}
-.vhs-times-col-datetime{min-width:8.5rem;}
+.vhs-times-content{display:flex;flex-direction:column;gap:0.75rem;}
+.vhs-times-summary-grid{display:flex;flex-wrap:wrap;gap:0.45rem;}
+.vhs-times-summary{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:0.45rem;}
+.vhs-times-summary li,.vhs-times-summary-item{display:inline-flex;align-items:center;gap:0.35rem;padding:0.35rem 0.7rem;border:1px solid rgba(0,0,0,0.08);border-radius:999px;background:#fff;font-size:0.88rem;line-height:1.4;}
+.vhs-times-heading{font-weight:600;color:var(--ct-primary,#333);font-size:0.9rem;}
+.vhs-times-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:0.45rem;}
+.vhs-times-list-item{display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem;padding:0.45rem 0.75rem;border:1px solid rgba(0,0,0,0.08);border-radius:12px;background:#fff;font-size:0.92rem;line-height:1.45;}
+.vhs-times-list-text{display:inline-flex;flex-wrap:wrap;gap:0.35rem;}
+.vhs-times-separator{color:rgba(0,0,0,0.35);}
 .vhs-times-date{font-weight:600;color:var(--ct-primary,#333);}
-.vhs-times-time{color:rgba(0,0,0,0.7);}
-.vhs-times-col-info span{display:block;}
-.vhs-times-details{margin:0;padding-left:1.1rem;}
-.vhs-times-details li{margin:0.25rem 0;}
+.vhs-times-time{font-variant-numeric:tabular-nums;}
+.vhs-times-location{color:rgba(0,0,0,0.7);}
+.vhs-times-status{padding:0.15rem 0.55rem;border-radius:999px;background:rgba(0,0,0,0.06);font-size:0.78rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:rgba(0,0,0,0.65);}
+.vhs-times-status--cancelled{background:rgba(220,53,69,0.14);color:#b02135;}
+.vhs-times-status--full{background:rgba(255,193,7,0.25);color:#8a6d00;}
 .vhs-button{display:inline-block;margin-top:1rem;background:var(--ct-primary,#0073aa);color:#fff;padding:0.6rem 1.2rem;border-radius:8px;text-decoration:none;font-weight:600;transition:all 0.2s ease-in-out;}
 .vhs-button:hover{background:var(--ct-primary-hover,#005b85);transform:translateY(-1px);}
 ");

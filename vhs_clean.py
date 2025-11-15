@@ -303,6 +303,13 @@ def format_times_summary(cell: Tag) -> List[str]:
     return list(iter_stripped_strings(cell))
 
 
+def prettify_summary_line(line: str) -> str:
+    if not line:
+        return ""
+    # Replace comma-separated fragments with middot separators for a calmer look
+    return re.sub(r",\s+", " · ", line)
+
+
 def format_times_details(cell: Tag) -> Tuple[List[Dict[str, str]], Optional[str]]:
     header: Optional[str] = None
     summary_tag = cell.find("summary")
@@ -355,26 +362,19 @@ def format_times_details(cell: Tag) -> Tuple[List[Dict[str, str]], Optional[str]
 def build_times_detail_text(item: Dict[str, str]) -> str:
     date_text = item.get("date", "")
     time_text = item.get("time", "")
+    parts: List[str] = []
+    if date_text:
+        parts.append(date_text)
+    if time_text:
+        parts.append(time_text)
+    location_text = item.get("location")
+    if location_text:
+        parts.append(location_text)
+    status_text = item.get("status")
+    if status_text:
+        parts.append(status_text)
 
-    leading_parts: List[str] = []
-    if date_text and time_text:
-        leading_parts.append(f"{date_text}, {time_text}")
-    elif date_text:
-        leading_parts.append(date_text)
-    elif time_text:
-        leading_parts.append(time_text)
-
-    extra_parts: List[str] = []
-    if item.get("status"):
-        extra_parts.append(item["status"])
-    if item.get("location"):
-        extra_parts.append(item["location"])
-
-    core_text = leading_parts[0] if leading_parts else ""
-    if extra_parts:
-        extras = " – ".join(extra_parts)
-        core_text = f"{core_text} – {extras}" if core_text else extras
-
+    core_text = " · ".join(part for part in parts if part)
     return f"- {core_text}" if core_text else ""
 
 
@@ -388,10 +388,14 @@ def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[s
     if summary_lines:
         summary_grid = soup.new_tag("div", attrs={"class": "vhs-times-summary-grid"})
         for line in summary_lines:
+            text = prettify_summary_line(line)
+            if not text:
+                continue
             item = soup.new_tag("div", attrs={"class": "vhs-times-summary-item"})
-            item.string = line
+            item.string = text
             summary_grid.append(item)
-        container.append(summary_grid)
+        if summary_grid.contents:
+            container.append(summary_grid)
 
     if detail_items:
         heading_text = heading or "Termine"
@@ -399,49 +403,46 @@ def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[s
         heading_tag.string = heading_text
         container.append(heading_tag)
 
-        table_wrapper = soup.new_tag("div", attrs={"class": "vhs-times-table-wrapper"})
-        table = soup.new_tag("table", attrs={"class": "vhs-times-table"})
-        tbody = soup.new_tag("tbody")
+        list_tag = soup.new_tag("ul", attrs={"class": "vhs-times-list"})
 
         for detail in detail_items:
-            row = soup.new_tag("tr")
+            list_item = soup.new_tag("li", attrs={"class": "vhs-times-list-item"})
 
-            datetime_cell = soup.new_tag("td", attrs={"class": "vhs-times-col-datetime"})
-            date_value = detail.get("date")
-            time_value = detail.get("time")
-            if date_value:
-                date_span = soup.new_tag("span", attrs={"class": "vhs-times-date"})
-                date_span.string = date_value
-                datetime_cell.append(date_span)
-            if time_value:
-                if datetime_cell.contents:
-                    datetime_cell.append(soup.new_tag("br"))
-                time_span = soup.new_tag("span", attrs={"class": "vhs-times-time"})
-                time_span.string = time_value
-                datetime_cell.append(time_span)
+            def append_part(class_names, text: Optional[str]) -> None:
+                if not text:
+                    return
+                if list_item.contents:
+                    separator = soup.new_tag("span", attrs={"class": "vhs-times-separator", "aria-hidden": "true"})
+                    separator.string = "·"
+                    list_item.append(separator)
 
-            info_cell = soup.new_tag("td", attrs={"class": "vhs-times-col-info"})
-            info_parts: List[str] = []
-            if detail.get("location"):
-                info_parts.append(detail["location"])
-            if detail.get("status"):
-                info_parts.append(detail["status"])
+                span = soup.new_tag("span")
+                if isinstance(class_names, str):
+                    span["class"] = [class_names]
+                else:
+                    span["class"] = list(class_names)
+                span.string = text
+                list_item.append(span)
 
-            if info_parts:
-                for index, part in enumerate(info_parts):
-                    if index > 0:
-                        info_cell.append(soup.new_tag("br"))
-                    span = soup.new_tag("span")
-                    span.string = part
-                    info_cell.append(span)
+            append_part("vhs-times-date", detail.get("date"))
+            append_part("vhs-times-time", detail.get("time"))
+            append_part("vhs-times-location", detail.get("location"))
 
-            row.append(datetime_cell)
-            row.append(info_cell)
-            tbody.append(row)
+            status_text = detail.get("status")
+            if status_text:
+                status_classes = ["vhs-times-status"]
+                lowered = status_text.lower()
+                if "abgesagt" in lowered:
+                    status_classes.append("vhs-times-status--cancelled")
+                elif "ausgebucht" in lowered or "belegt" in lowered:
+                    status_classes.append("vhs-times-status--full")
+                append_part(status_classes, status_text)
 
-        table.append(tbody)
-        table_wrapper.append(table)
-        container.append(table_wrapper)
+            if list_item.contents:
+                list_tag.append(list_item)
+
+        if list_tag.contents:
+            container.append(list_tag)
 
     return container.decode()
 
@@ -477,6 +478,8 @@ def extract_times(soup: BeautifulSoup) -> Dict[str, str]:
     table.decompose()
 
     text_sections: List[str] = []
+    summary_lines = [prettify_summary_line(line) for line in summary_lines if line]
+
     if summary_lines:
         text_sections.append("\n".join(summary_lines))
     if detail_items:
