@@ -281,9 +281,45 @@ function vhs_import_kurse($json_source = null) {
     return $result;
 }
 
+function vhs_normalize_json_url($url) {
+    $parts = wp_parse_url($url);
+    if (!$parts || empty($parts['host'])) {
+        return $url;
+    }
+
+    if ($parts['host'] === 'github.com' && !empty($parts['path'])) {
+        $path_segments = array_values(array_filter(explode('/', $parts['path'])));
+        $blob_index = array_search('blob', $path_segments, true);
+        if ($blob_index !== false && isset($path_segments[$blob_index + 2])) {
+            $owner = $path_segments[0] ?? null;
+            $repo = $path_segments[1] ?? null;
+            $branch = $path_segments[$blob_index + 1] ?? null;
+            $file_path_segments = array_slice($path_segments, $blob_index + 2);
+            if ($owner && $repo && $branch && $file_path_segments) {
+                $normalized = sprintf(
+                    'https://raw.githubusercontent.com/%s/%s/%s/%s',
+                    $owner,
+                    $repo,
+                    $branch,
+                    implode('/', $file_path_segments)
+                );
+
+                if (!empty($parts['query'])) {
+                    $normalized = $normalized . '?' . $parts['query'];
+                }
+
+                return $normalized;
+            }
+        }
+    }
+
+    return $url;
+}
+
 function vhs_load_json_data($json_source) {
     if (filter_var($json_source, FILTER_VALIDATE_URL)) {
-        $request_url = add_query_arg('_vhs_cache_bust', time(), $json_source);
+        $normalized_url = vhs_normalize_json_url($json_source);
+        $request_url = add_query_arg('_vhs_cache_bust', time(), $normalized_url);
         $response = wp_remote_get($request_url, [
             'timeout' => 20,
             'redirection' => 5,
