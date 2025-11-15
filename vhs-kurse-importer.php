@@ -38,43 +38,119 @@ add_action('admin_menu', function() {
 
 // --- Admin-Seite: Import ---
 function vhs_kurse_admin_page() {
-    if (isset($_POST['vhs_json_url'])) {
-        update_option('vhs_json_url', esc_url_raw($_POST['vhs_json_url']));
-        echo '<div class="updated"><p>✅ JSON-Quelle gespeichert.</p></div>';
+    $messages = [];
+    $current_source = get_option('vhs_source_choice', 'url');
+    if (!in_array($current_source, ['url', 'upload'], true)) {
+        $current_source = 'url';
     }
 
-    if (!empty($_FILES['vhs_json_upload']['tmp_name'])) {
+    if (isset($_POST['save_json_url'])) {
+        $saved_url_value = esc_url_raw($_POST['vhs_json_url']);
+        update_option('vhs_json_url', $saved_url_value);
+        update_option('vhs_source_choice', 'url');
+        $current_source = 'url';
+        $messages[] = ['class' => 'updated', 'text' => '✅ JSON-Quelle gespeichert.'];
+    }
+
+    if (!empty($_FILES['vhs_json_upload']['tmp_name']) && isset($_POST['upload_json'])) {
         $upload = wp_handle_upload($_FILES['vhs_json_upload'], ['test_form' => false]);
         if (!isset($upload['error'])) {
             update_option('vhs_uploaded_json', $upload['file']);
-            echo '<div class="updated"><p>✅ Datei hochgeladen: ' . esc_html(basename($upload['file'])) . '</p></div>';
+            update_option('vhs_source_choice', 'upload');
+            $current_source = 'upload';
+            $messages[] = ['class' => 'updated', 'text' => '✅ Datei hochgeladen: <code>' . esc_html(basename($upload['file'])) . '</code>.'];
         } else {
-            echo '<div class="error"><p>Fehler: ' . esc_html($upload['error']) . '</p></div>';
+            $messages[] = ['class' => 'error', 'text' => 'Fehler: ' . esc_html($upload['error'])];
         }
     }
 
+    $saved_url_value = get_option('vhs_json_url', '');
+    $uploaded_path = get_option('vhs_uploaded_json', '');
+    $uploaded_exists = $uploaded_path && file_exists($uploaded_path);
+    $uploaded_file_name = $uploaded_path ? basename($uploaded_path) : '';
+
     if (isset($_POST['vhs_import_now'])) {
-        $source = get_option('vhs_uploaded_json') ?: get_option('vhs_json_url');
-        vhs_import_kurse($source);
-        echo '<div class="updated"><p>✅ Import abgeschlossen.</p></div>';
+        $selected_source = sanitize_text_field($_POST['vhs_source_choice'] ?? $current_source);
+        if (!in_array($selected_source, ['url', 'upload'], true)) {
+            $selected_source = $current_source;
+        }
+        update_option('vhs_source_choice', $selected_source);
+        $current_source = $selected_source;
+
+        if ($selected_source === 'upload') {
+            if (!$uploaded_exists) {
+                $messages[] = ['class' => 'error', 'text' => '❌ Keine gültige hochgeladene Datei gefunden. Bitte laden Sie eine neue Datei hoch.'];
+            } else {
+                vhs_import_kurse($uploaded_path);
+                $messages[] = ['class' => 'updated', 'text' => '✅ Import abgeschlossen. Quelle: Hochgeladene Datei <code>' . esc_html($uploaded_file_name) . '</code>.'];
+            }
+        } else {
+            if (empty($saved_url_value)) {
+                $messages[] = ['class' => 'error', 'text' => '❌ Keine JSON-URL gespeichert. Bitte tragen Sie eine URL ein.'];
+            } else {
+                vhs_import_kurse($saved_url_value);
+                $messages[] = ['class' => 'updated', 'text' => '✅ Import abgeschlossen. Quelle: Gespeicherte URL.'];
+            }
+        }
     }
 
-    $saved_url = esc_attr(get_option('vhs_json_url', ''));
-    $uploaded_file = esc_html(basename(get_option('vhs_uploaded_json', 'Keine Datei')));
+    if ($current_source === 'upload' && !$uploaded_exists && $uploaded_path) {
+        $messages[] = ['class' => 'notice notice-warning', 'text' => '⚠️ Die ausgewählte Datei konnte nicht gefunden werden. Bitte erneut hochladen.'];
+    }
 
-    echo '<div class="wrap"><h1>VHS-Kurse Import</h1>
-        <form method="post" enctype="multipart/form-data">
-            <h2>1️⃣ JSON-URL</h2>
-            <p><input type="url" name="vhs_json_url" value="' . $saved_url . '" size="60"> ';
+    if ($current_source === 'url' && empty($saved_url_value)) {
+        $messages[] = ['class' => 'notice notice-warning', 'text' => '⚠️ Es ist keine JSON-URL gespeichert. Bitte ergänzen Sie eine URL, bevor Sie importieren.'];
+    }
+
+    $saved_url_attr = esc_attr($saved_url_value);
+    $saved_url_display = $saved_url_value ? '<code>' . esc_html($saved_url_value) . '</code>' : '<em>Keine URL gespeichert</em>';
+    $uploaded_file_display = $uploaded_exists ? '<code>' . esc_html($uploaded_file_name) . '</code>' : '<em>Keine Datei verfügbar</em>';
+    if ($uploaded_path && !$uploaded_exists) {
+        $uploaded_file_display .= ' <span class="description">(Datei nicht gefunden)</span>';
+    }
+
+    if ($current_source === 'upload' && $uploaded_exists) {
+        $active_source_html = 'Hochgeladene Datei <code>' . esc_html($uploaded_file_name) . '</code>';
+    } elseif ($current_source === 'upload') {
+        $active_source_html = 'Hochgeladene Datei <em>nicht verfügbar</em>';
+    } elseif (!empty($saved_url_value)) {
+        $active_source_html = 'Gespeicherte URL <code>' . esc_html($saved_url_value) . '</code>';
+    } else {
+        $active_source_html = 'Gespeicherte URL <em>nicht gesetzt</em>';
+    }
+
+    foreach ($messages as $message) {
+        $class = isset($message['class']) ? $message['class'] : 'updated';
+        echo '<div class="' . esc_attr($class) . '"><p>' . $message['text'] . '</p></div>';
+    }
+
+    echo '<div class="notice notice-info"><p>Aktive Quelle für den nächsten Import: <strong>' . $active_source_html . '</strong></p></div>';
+
+    echo '<div class="wrap"><h1>VHS-Kurse Import</h1>';
+    echo '<form method="post" enctype="multipart/form-data">';
+
+    echo '<h2>1️⃣ JSON-URL</h2>';
+    echo '<p><input type="url" name="vhs_json_url" value="' . $saved_url_attr . '" size="60"> ';
     submit_button('Speichern', 'secondary', 'save_json_url', false);
-    echo '</p><h2>2️⃣ Oder lokale Datei</h2>
-            <input type="file" name="vhs_json_upload" accept=".json">
-            <p>Aktuelle Datei: <code>' . $uploaded_file . '</code></p>';
+    echo '</p>';
+    echo '<p class="description">Gespeicherte URL: ' . $saved_url_display . '</p>';
+
+    echo '<h2>2️⃣ Lokale Datei hochladen</h2>';
+    echo '<input type="file" name="vhs_json_upload" accept=".json"> ';
     submit_button('Datei hochladen', 'secondary', 'upload_json', false);
-    echo '<h2>3️⃣ Import starten</h2>';
+    echo '<p class="description">Aktuelle Datei: ' . $uploaded_file_display . '</p>';
+
+    echo '<h2>3️⃣ Quelle für den Import wählen</h2>';
+    echo '<fieldset style="margin-bottom:1rem;">';
+    echo '<label style="display:block;margin-bottom:0.6rem;"><input type="radio" name="vhs_source_choice" value="url" ' . checked($current_source, 'url', false) . '> Gespeicherte URL ' . $saved_url_display . '</label>';
+    echo '<label style="display:block;"><input type="radio" name="vhs_source_choice" value="upload" ' . checked($current_source, 'upload', false) . '> Hochgeladene Datei ' . $uploaded_file_display . '</label>';
+    echo '</fieldset>';
+
+    echo '<h2>4️⃣ Import starten</h2>';
     submit_button('Jetzt importieren', 'primary', 'vhs_import_now');
     echo '</form></div>';
 }
+
 
 // --- Cronjob täglich ---
 if (!wp_next_scheduled('vhs_import_cron')) {
