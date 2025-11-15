@@ -59,6 +59,9 @@ def extract_course_links(html):
 
 def clean_description_container(container, title=None):
     """Bereinigt HTML, behält aber Formatierung."""
+    if container is None:
+        return ""
+
     for tag in container.find_all(
         ["script", "style", "picture", "figure", "header", "footer"], recursive=True
     ):
@@ -76,11 +79,15 @@ def clean_description_container(container, title=None):
         if hasattr(parent, "decompose"):
             parent.decompose()
 
-    for table in container.find_all("table"):
+    for table in list(container.find_all("table")):
+        if not hasattr(table, "get"):
+            continue
         classes = table.get("class", [])
         if "layoutgrid" in classes or table.find("label"):
             table.decompose()
-    for table in container.find_all("table"):
+    for table in list(container.find_all("table")):
+        if not hasattr(table, "get_text"):
+            continue
         if not table.get_text(strip=True):
             table.decompose()
 
