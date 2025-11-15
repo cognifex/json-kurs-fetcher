@@ -81,15 +81,15 @@ function vhs_kurse_admin_page() {
             if (!$uploaded_exists) {
                 $messages[] = ['class' => 'error', 'text' => '❌ Keine gültige hochgeladene Datei gefunden. Bitte laden Sie eine neue Datei hoch.'];
             } else {
-                vhs_import_kurse($uploaded_path);
-                $messages[] = ['class' => 'updated', 'text' => '✅ Import abgeschlossen. Quelle: Hochgeladene Datei <code>' . esc_html($uploaded_file_name) . '</code>.'];
+                $result = vhs_import_kurse($uploaded_path);
+                $messages[] = vhs_build_import_message($result, 'Hochgeladene Datei <code>' . esc_html($uploaded_file_name) . '</code>');
             }
         } else {
             if (empty($saved_url_value)) {
                 $messages[] = ['class' => 'error', 'text' => '❌ Keine JSON-URL gespeichert. Bitte tragen Sie eine URL ein.'];
             } else {
-                vhs_import_kurse($saved_url_value);
-                $messages[] = ['class' => 'updated', 'text' => '✅ Import abgeschlossen. Quelle: Gespeicherte URL.'];
+                $result = vhs_import_kurse($saved_url_value);
+                $messages[] = vhs_build_import_message($result, 'Gespeicherte URL');
             }
         }
     }
@@ -121,7 +121,12 @@ function vhs_kurse_admin_page() {
 
     foreach ($messages as $message) {
         $class = isset($message['class']) ? $message['class'] : 'updated';
-        echo '<div class="' . esc_attr($class) . '"><p>' . $message['text'] . '</p></div>';
+        echo '<div class="' . esc_attr($class) . '"><p>' . wp_kses_post($message['text']) . '</p></div>';
+    }
+
+    $last_result = get_option('vhs_last_import_result');
+    if (is_array($last_result) && !empty($last_result['status'])) {
+        echo '<div class="notice notice-info"><p>' . wp_kses_post(vhs_render_last_result($last_result)) . '</p></div>';
     }
 
     echo '<div class="notice notice-info"><p>Aktive Quelle für den nächsten Import: <strong>' . $active_source_html . '</strong></p></div>';
@@ -156,28 +161,35 @@ function vhs_kurse_admin_page() {
 if (!wp_next_scheduled('vhs_import_cron')) {
     wp_schedule_event(time(), 'daily', 'vhs_import_cron');
 }
-add_action('vhs_import_cron', 'vhs_import_kurse');
+add_action('vhs_import_cron', function() {
+    vhs_import_kurse();
+});
 
 // --- Hauptimporter mit sicherem Bild-Download ---
 function vhs_import_kurse($json_source = null) {
     if (!$json_source) $json_source = get_option('vhs_json_url');
-    if (!$json_source) return;
+    if (!$json_source) return new WP_Error('vhs_missing_source', 'Keine Datenquelle konfiguriert.');
 
-    if (filter_var($json_source, FILTER_VALIDATE_URL)) {
-        $response = wp_remote_get($json_source);
-        if (is_wp_error($response)) return;
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-    } else {
-        $data = json_decode(file_get_contents($json_source), true);
+    $data = vhs_load_json_data($json_source);
+    if (is_wp_error($data)) {
+        vhs_store_import_result([
+            'status'  => 'error',
+            'message' => $data->get_error_message(),
+            'source'  => $json_source,
+        ]);
+        return $data;
     }
-    if (!$data || !is_array($data)) return;
 
     $found_guids = [];
+    $created = 0;
+    $updated = 0;
+    $total = 0;
 
     foreach ($data as $kurs) {
         $guid = sanitize_text_field($kurs['guid'] ?? '');
         if (!$guid) continue;
         $found_guids[] = $guid;
+        $total++;
 
         $existing = get_posts([
             'post_type' => VHS_POST_TYPE,
@@ -192,11 +204,13 @@ function vhs_import_kurse($json_source = null) {
             'post_type' => VHS_POST_TYPE,
             'post_status' => 'publish'
         ];
-
         $post_id = $existing ? $existing[0]->ID : wp_insert_post($post_data);
         if ($existing) {
             $post_data['ID'] = $post_id;
             wp_update_post($post_data);
+            $updated++;
+        } else {
+            $created++;
         }
 
         // Meta aktualisieren
@@ -241,12 +255,116 @@ function vhs_import_kurse($json_source = null) {
 
     // --- Alte Kurse deaktivieren ---
     $all_existing = get_posts(['post_type' => VHS_POST_TYPE, 'numberposts' => -1]);
+    $deactivated = 0;
     foreach ($all_existing as $p) {
         $guid = get_post_meta($p->ID, 'vhs_guid', true);
         if ($guid && !in_array($guid, $found_guids)) {
-            wp_update_post(['ID' => $p->ID, 'post_status' => 'draft']);
+            if ($p->post_status !== 'draft') {
+                wp_update_post(['ID' => $p->ID, 'post_status' => 'draft']);
+                $deactivated++;
+            }
         }
     }
+
+    $result = [
+        'status'       => 'success',
+        'total'        => $total,
+        'created'      => $created,
+        'updated'      => $updated,
+        'deactivated'  => $deactivated,
+        'source'       => $json_source,
+        'timestamp'    => current_time('timestamp'),
+    ];
+
+    vhs_store_import_result($result);
+
+    return $result;
+}
+
+function vhs_load_json_data($json_source) {
+    if (filter_var($json_source, FILTER_VALIDATE_URL)) {
+        $request_url = add_query_arg('_vhs_cache_bust', time(), $json_source);
+        $response = wp_remote_get($request_url, [
+            'timeout' => 20,
+            'redirection' => 5,
+            'headers' => [
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                'Pragma' => 'no-cache',
+            ],
+        ]);
+        if (is_wp_error($response)) {
+            return $response;
+        }
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code !== 200) {
+            return new WP_Error('vhs_http_error', 'HTTP ' . $code . ' beim Abruf der JSON-Quelle.');
+        }
+        $body = wp_remote_retrieve_body($response);
+    } else {
+        if (!is_readable($json_source)) {
+            return new WP_Error('vhs_file_error', 'Die ausgewählte Datei kann nicht gelesen werden.');
+        }
+        $body = file_get_contents($json_source);
+    }
+
+    $data = json_decode($body, true);
+    if (!is_array($data)) {
+        return new WP_Error('vhs_invalid_json', 'Die JSON-Daten konnten nicht verarbeitet werden.');
+    }
+
+    return $data;
+}
+
+function vhs_store_import_result($result) {
+    $result['timestamp'] = $result['timestamp'] ?? current_time('timestamp');
+    update_option('vhs_last_import_result', $result);
+}
+
+function vhs_build_import_message($result, $source_label) {
+    if (is_wp_error($result)) {
+        return [
+            'class' => 'error',
+            'text'  => '❌ Import fehlgeschlagen (' . esc_html($source_label) . '): ' . esc_html($result->get_error_message()),
+        ];
+    }
+
+    $text = sprintf(
+        '✅ Import abgeschlossen (%s). %d Gesamt, %d erstellt, %d aktualisiert, %d deaktiviert.',
+        wp_kses_post($source_label),
+        intval($result['total'] ?? 0),
+        intval($result['created'] ?? 0),
+        intval($result['updated'] ?? 0),
+        intval($result['deactivated'] ?? 0)
+    );
+
+    return [
+        'class' => 'updated',
+        'text'  => $text,
+    ];
+}
+
+function vhs_render_last_result($result) {
+    $time = !empty($result['timestamp']) ? date_i18n('d.m.Y H:i', $result['timestamp']) : '';
+    $source = !empty($result['source']) ? esc_html($result['source']) : 'Unbekannt';
+
+    if (($result['status'] ?? '') === 'success') {
+        return sprintf(
+            'Letzter erfolgreicher Import am %s von <code>%s</code>: %d Gesamt, %d erstellt, %d aktualisiert, %d deaktiviert.',
+            esc_html($time),
+            $source,
+            intval($result['total'] ?? 0),
+            intval($result['created'] ?? 0),
+            intval($result['updated'] ?? 0),
+            intval($result['deactivated'] ?? 0)
+        );
+    }
+
+    return sprintf(
+        'Letzter Import-Versuch am %s von <code>%s</code> fehlgeschlagen: %s',
+        esc_html($time),
+        $source,
+        esc_html($result['message'] ?? 'Unbekannter Fehler')
+    );
 }
 
 // --- Shortcode für Felder ---
