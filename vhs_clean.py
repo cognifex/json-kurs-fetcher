@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 ADMIN_KEYWORDS = {
@@ -22,9 +22,254 @@ ADMIN_KEYWORDS = {
     "zahlung",
 }
 
+ALLOWED_BLOCK_TAGS = {
+    "p",
+    "ul",
+    "ol",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "blockquote",
+}
+
+ALLOWED_INLINE_TAGS = {
+    "strong",
+    "em",
+    "b",
+    "i",
+    "u",
+    "sup",
+    "sub",
+    "span",
+    "a",
+    "code",
+}
+
+ALLOWED_LIST_TAGS = {"li"}
+
+ALLOWED_TAGS = ALLOWED_BLOCK_TAGS | ALLOWED_INLINE_TAGS | ALLOWED_LIST_TAGS | {"br"}
+
+ALLOWED_ATTRIBUTES = {
+    "a": {"href", "title"},
+}
+
+REMOVED_TAGS = {
+    "script",
+    "style",
+    "picture",
+    "figure",
+    "img",
+    "svg",
+    "header",
+    "footer",
+    "noscript",
+}
+
+STOP_KEYWORDS = {
+    "zeiten",
+    "anzahl",
+    "termine",
+    "leitung",
+    "nummer",
+    "ort",
+    "preis",
+}
+
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def convert_span_formatting(tag: Tag) -> None:
+    if tag.name != "span":
+        return
+
+    raw_style = tag.get("style", "")
+    style_map = {}
+    for chunk in raw_style.split(";"):
+        if ":" not in chunk:
+            continue
+        key, value = chunk.split(":", 1)
+        style_map[key.strip().lower()] = value.strip().lower()
+
+    classes = [cls.lower() for cls in tag.get("class", [])]
+
+    font_weight = style_map.get("font-weight")
+    font_style = style_map.get("font-style")
+
+    if font_weight in {"bold", "bolder", "600", "700", "800", "900"} or any("bold" in cls for cls in classes):
+        tag.name = "strong"
+    elif font_style in {"italic", "oblique"} or any(cls in {"italic", "kursiv"} or "italic" in cls for cls in classes):
+        tag.name = "em"
+
+    if "style" in tag.attrs:
+        del tag.attrs["style"]
+    if "class" in tag.attrs:
+        del tag.attrs["class"]
+
+
+def sanitize_tag(tag: Tag) -> None:
+    convert_span_formatting(tag)
+
+    if tag.name not in ALLOWED_TAGS:
+        tag.unwrap()
+        return
+
+    allowed = ALLOWED_ATTRIBUTES.get(tag.name, set())
+    for attr in list(tag.attrs):
+        if attr not in allowed:
+            del tag.attrs[attr]
+
+    if tag.name == "a" and "href" in tag.attrs:
+        tag.attrs["href"] = tag.attrs["href"].strip()
+        if not tag.attrs["href"]:
+            del tag.attrs["href"]
+
+
+def clean_description_tree(root: Tag) -> None:
+    for removable in list(root.find_all(REMOVED_TAGS)):
+        removable.decompose()
+
+    for tag in list(root.find_all(True)):
+        sanitize_tag(tag)
+
+    unwrap_block_wrappers(root)
+    normalize_orphan_list_items(root)
+
+    for tag in list(root.find_all(True)):
+        if tag.name == "br":
+            continue
+        text_content = normalize_whitespace(tag.get_text(" "))
+        if text_content:
+            continue
+        tag.decompose()
+
+
+def unwrap_block_wrappers(root: Tag) -> None:
+    block_like_children = (ALLOWED_BLOCK_TAGS | {"ul", "ol"}) - {"p"}
+    for paragraph in list(root.find_all("p")):
+        if any(isinstance(child, Tag) and child.name in block_like_children for child in paragraph.children):
+            paragraph.unwrap()
+
+
+def normalize_orphan_list_items(root: Tag) -> None:
+    for child in list(root.children):
+        if isinstance(child, Tag):
+            normalize_orphan_list_items(child)
+
+    if not isinstance(root, Tag):
+        return
+
+    if root.name in {"ul", "ol"}:
+        return
+
+    wrapper: Optional[Tag] = None
+    for child in list(root.children):
+        if isinstance(child, Tag) and child.name == "li":
+            if wrapper is None:
+                wrapper = root.new_tag("ul")
+                child.insert_before(wrapper)
+            child.extract()
+            wrapper.append(child)
+        else:
+            wrapper = None
+
+
+def collect_blocks(root: Tag, soup: BeautifulSoup) -> List[Tag]:
+    blocks: List[Tag] = []
+    for child in list(root.children):
+        if isinstance(child, NavigableString):
+            text = normalize_whitespace(str(child))
+            if not text:
+                continue
+            paragraph = soup.new_tag("p")
+            paragraph.string = text
+            blocks.append(paragraph)
+            continue
+
+        if not isinstance(child, Tag):
+            continue
+
+        if child.name in ALLOWED_BLOCK_TAGS:
+            blocks.append(child)
+        elif child.name in ALLOWED_INLINE_TAGS:
+            child.extract()
+            paragraph = soup.new_tag("p")
+            paragraph.append(child)
+            blocks.append(paragraph)
+        else:
+            blocks.extend(collect_blocks(child, soup))
+
+    deduped: List[Tag] = []
+    seen_ids = set()
+    for block in blocks:
+        identifier = id(block)
+        if identifier in seen_ids:
+            continue
+        seen_ids.add(identifier)
+        deduped.append(block)
+    return deduped
+
+
+def filter_admin_blocks(blocks: Sequence[Tag]) -> List[Tag]:
+    filtered: List[Tag] = []
+    last_text: Optional[str] = None
+    for block in blocks:
+        text = normalize_whitespace(block.get_text(" ", strip=True))
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(keyword in lowered for keyword in ADMIN_KEYWORDS):
+            continue
+        if last_text == text:
+            continue
+        filtered.append(block)
+        last_text = text
+    return filtered
+
+
+def truncate_after_stop_keywords(blocks: Sequence[Tag]) -> List[Tag]:
+    trimmed: List[Tag] = []
+    for block in blocks:
+        text = normalize_whitespace(block.get_text(" ", strip=True))
+        lowered = text.lower()
+        if any(lowered.startswith(keyword) for keyword in STOP_KEYWORDS):
+            break
+        trimmed.append(block)
+    return trimmed
+
+
+def ensure_title_block(blocks: List[Tag], soup: BeautifulSoup, title: str) -> List[Tag]:
+    normalized_title = normalize_whitespace(title)
+    if not normalized_title:
+        return blocks
+
+    if blocks:
+        first_text = normalize_whitespace(blocks[0].get_text(" ", strip=True))
+        if first_text.lower() == normalized_title.lower():
+            return blocks
+
+    title_paragraph = soup.new_tag("p")
+    strong_tag = soup.new_tag("strong")
+    strong_tag.string = normalized_title
+    title_paragraph.append(strong_tag)
+    return [title_paragraph, *blocks]
+
+
+def blocks_to_string(blocks: Sequence[Tag]) -> str:
+    if not blocks:
+        return ""
+
+    output = BeautifulSoup("", "html.parser")
+    for index, block in enumerate(blocks):
+        output.append(block)
+        if index != len(blocks) - 1:
+            output.append(output.new_string("\n\n"))
+
+    return output.decode().strip()
 
 
 def iter_stripped_strings(node: Tag) -> Iterable[str]:
@@ -136,61 +381,16 @@ def extract_times(soup: BeautifulSoup) -> str:
     return "\n\n".join(section for section in sections if section).strip()
 
 
-def remove_admin_lines(lines: Sequence[str]) -> List[str]:
-    result: List[str] = []
-    for line in lines:
-        lowered = line.lower()
-        if any(keyword in lowered for keyword in ADMIN_KEYWORDS):
-            continue
-        if not result or result[-1] != line:
-            result.append(line)
-    return result
-
-
-def join_paragraphs(lines: Sequence[str]) -> str:
-    paragraphs: List[str] = []
-    index = 0
-    length = len(lines)
-    while index < length:
-        line = lines[index]
-        if line.startswith("- "):
-            bullet_block: List[str] = []
-            while index < length and lines[index].startswith("- "):
-                bullet_block.append(lines[index])
-                index += 1
-            paragraphs.append("\n".join(bullet_block))
-        else:
-            paragraphs.append(line)
-            index += 1
-    return "\n\n".join(paragraphs).strip()
-
-
 def extract_description(soup: BeautifulSoup, title: str) -> str:
-    for tag in soup.find_all(["script", "style", "picture", "figure", "img", "svg", "header", "footer"]):
-        tag.decompose()
+    clean_description_tree(soup)
 
-    for li in soup.find_all("li"):
-        bullet_text = normalize_whitespace(" ".join(li.stripped_strings))
-        li.clear()
-        if bullet_text:
-            li.append(f"- {bullet_text}")
-    for container in soup.find_all(["ul", "ol"]):
-        container.unwrap()
+    root = soup.body or soup
+    blocks = collect_blocks(root, soup)
+    blocks = filter_admin_blocks(blocks)
+    blocks = truncate_after_stop_keywords(blocks)
+    blocks = ensure_title_block(blocks, soup, title)
 
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
-
-    text = soup.get_text("\n")
-    raw_lines = [normalize_whitespace(line) for line in text.splitlines()]
-    lines = [line for line in raw_lines if line]
-    lines = remove_admin_lines(lines)
-
-    title = title.strip()
-    if title:
-        if not lines or lines[0].lower() != title.lower():
-            lines.insert(0, title)
-
-    return join_paragraphs(lines)
+    return blocks_to_string(blocks)
 
 
 def process_course(course: dict) -> dict:
