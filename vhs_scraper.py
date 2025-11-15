@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scraper für Kursangebote der VHS Lahnstein."""
+"""Scraper für Kursangebote der VHS Lahnstein — Hotfix-Version."""
 
 import argparse
 import json
@@ -28,7 +28,6 @@ HEADERS = {
 LABELS = ["Nummer", "Leitung", "Ort", "Preis"]
 
 DEBUG_MODE = False
-
 
 # ---------------------------------------------------------------------------
 # Netzwerk
@@ -71,115 +70,122 @@ def extract_course_links(html):
 
 
 # ---------------------------------------------------------------------------
-# Beschreibung bereinigen (mit Stabilitäts-Fix)
+# Beschreibung bereinigen (safe-mode Hotfix)
 # ---------------------------------------------------------------------------
 
-def clean_description_container(container, title=None):
-    """Bereinigt HTML, behält aber Formatierung."""
+def clean_description_container(container, title=None, safe=False):
+    """
+    Bereinigt HTML.
+    HOTFIX:
+    - safe=True = Labels NICHT entfernen (neue VHS-Seiten haben sie mitten im Text)
+    """
     if not isinstance(container, Tag):
         return ""
 
-    # Entferne störende Tags
-    for tag in container.find_all(
-        ["script", "style", "picture", "figure", "header", "footer"],
-        recursive=True
-    ):
+    # JavaScript/CSS entfernen
+    for tag in container.find_all(["script", "style", "picture", "figure", "header", "footer"]):
         tag.decompose()
 
-    # Entferne Blöcke, die Labels enthalten
-    for block in container.find_all(
-        string=re.compile(r"\b(Zeiten|Preis|Nummer|Leitung|Ort|Bankverbindung)\b", re.I)
-    ):
-        parent = block.find_parent(["div", "p", "li", "tr", "table"]) or block.parent
-        if isinstance(parent, Tag):
-            parent.decompose()
+    # Ursprüngliche Entfernung der Label-Blöcke — nur wenn nicht safe
+    if not safe:
+        for block in container.find_all(
+            string=re.compile(r"\b(Zeiten|Preis|Nummer|Leitung|Ort|Bankverbindung)\b", re.I)
+        ):
+            parent = block.find_parent(["div", "p", "li", "tr", "table"]) or block.parent
+            if isinstance(parent, Tag):
+                parent.decompose()
 
-    # Tabellen entfernen (robuster)
+    # Tabellen entfernen
     for table in list(container.find_all("table")):
         if not isinstance(table, Tag):
             continue
 
         classes = table.get("class", []) or []
-
-        if "layoutgrid" in classes:
-            table.decompose()
-            continue
-
-        if table.find("label"):
+        if "layoutgrid" in classes or table.find("label"):
             table.decompose()
             continue
 
         try:
             if not table.get_text(strip=True):
                 table.decompose()
-                continue
         except Exception:
             table.decompose()
-            continue
 
     # Unerwünschte Attribute entfernen
     for tag in container.find_all(True):
         if isinstance(tag, Tag):
             tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
 
-    # Titel entfernen (falls doppelt)
-    if title:
-        normalized_title = re.sub(r"\s+", " ", title).strip().lower()
-        for heading in container.find_all(["h1", "h2"]):
-            txt = re.sub(r"\s+", " ", heading.get_text(strip=True)).lower()
-            if txt == normalized_title:
-                heading.decompose()
-
     html_text = container.decode_contents().strip()
     return re.sub(r"\s+\n", "\n", html_text)
 
 
 # ---------------------------------------------------------------------------
-# Beschreibung sammeln (mit Fallback)
+# Beschreibung sammeln (mit erweitertem Hotfix)
 # ---------------------------------------------------------------------------
 
 def collect_description(soup, title=None):
-    """Fasst relevante Inhaltsblöcke zusammen."""
+    """Fasst relevante Inhaltsblöcke zusammen (Hotfix für neues VHS-Template)."""
     primary_selectors = [
         "div.VeranstaltungInhalt",
         "div.VeranstaltungBeschreibung",
         "section.veranstaltungInhalt",
     ]
+
     fallback_selectors = [
         "div.Text.Detail",
         "main#content div.Text",
     ]
 
+    # HOTFIX: neue VHS-Struktur
+    hotfix_selectors = [
+        "#content div.Text.Detail",
+        "div#content div.Text.Detail",
+        "main div.Text.Detail",
+        "#content div.Text",
+    ]
+
+    # 1. Original-Selektoren
     sections = []
     seen = set()
-
     for selector in primary_selectors:
         for node in soup.select(selector):
-            if id(node) in seen:
-                continue
-            seen.add(id(node))
-            sections.append(node)
+            if id(node) not in seen:
+                seen.add(id(node))
+                sections.append(node)
 
+    # 2. Alte Fallbacks
     if not sections:
         for selector in fallback_selectors:
             for node in soup.select(selector):
-                if id(node) in seen:
-                    continue
-                seen.add(id(node))
-                sections.append(node)
+                if id(node) not in seen:
+                    seen.add(id(node))
+                    sections.append(node)
             if sections:
                 break
 
-    # Letzter Fallback: main/content/body
+    # 3. HOTFIX
+    if not sections:
+        for selector in hotfix_selectors:
+            for node in soup.select(selector):
+                if id(node) not in seen:
+                    seen.add(id(node))
+                    sections.append(node)
+            if sections:
+                break
+
+    # 4. Letzter Notfall
     if not sections:
         fallback = soup.select_one("main, #content, body")
         if fallback:
-            return clean_description_container(fallback, title=title)
+            return clean_description_container(fallback, title=title, safe=True)
         return ""
 
     merged_html = "".join(section.decode_contents() for section in sections)
     wrapper = BeautifulSoup(f"<div>{merged_html}</div>", "html.parser")
-    return clean_description_container(wrapper.div, title=title)
+
+    # HOTFIX: safe=True, damit Labels nicht entfernt werden
+    return clean_description_container(wrapper.div, title=title, safe=True)
 
 
 # ---------------------------------------------------------------------------
