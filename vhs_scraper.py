@@ -1,162 +1,229 @@
 #!/usr/bin/env python3
+"""Scraper für Kursangebote der VHS Lahnstein."""
+
+import json
+import re
+import time
+
 import requests
 from bs4 import BeautifulSoup
-import json, re, time
 
 BASE_URL = "https://vhs-lahnstein.de"
-SEARCH_URL = (
-    "https://vhs-lahnstein.de/Suche?"
-    "cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes"
-    "&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1"
-)
+OVERVIEW_URLS = [
+    "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes"
+    "&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1",
+]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/129.0.0.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/129.0.0.0 Safari/537.36"
+    )
 }
+
+LABELS = ["Nummer", "Leitung", "Ort", "Preis"]
 
 
 def fetch(url):
-    """Hilfsfunktion mit Retry"""
-    for _ in range(3):
+    """Lädt HTML mit Headern und einfachem Retry."""
+    for attempt in range(3):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            if r.status_code == 200:
-                return r.text
-            elif r.status_code == 410:
+            response = requests.get(url, headers=HEADERS, timeout=20)
+            if response.status_code == 200:
+                return response.text
+            if response.status_code == 410:
                 print(f"⚠️ Seite entfernt: {url}")
                 return None
-        except Exception as e:
-            print(f"Fehler bei Abruf {url}: {e}")
-            time.sleep(1)
+            print(f"⚠️ Status {response.status_code} für {url}")
+        except requests.RequestException as exc:
+            print(f"⚠️ Fehler bei Abruf {url}: {exc}")
+        time.sleep(1 + attempt)
     return None
 
 
-def extract_course_links(search_html):
-    """Alle Kurslinks aus der Übersichtsseite sammeln"""
-    soup = BeautifulSoup(search_html, "html.parser")
+def extract_course_links(html):
+    """Sammelt Kurslinks von einer Übersichtsseite."""
+    soup = BeautifulSoup(html, "html.parser")
     links = []
-    for a in soup.select("a[href*='/Veranstaltung/cmx']"):
-        href = a.get("href")
-        if href and href.startswith("/Veranstaltung/cmx") and href.endswith(".html"):
-            links.append(BASE_URL + href)
+    for anchor in soup.select("a[href*='/Veranstaltung/cmx']"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        if not href.startswith("http"):
+            href = BASE_URL + href
+        if href.endswith(".html"):
+            links.append(href)
     return sorted(set(links))
 
 
-def clean_html_keep_format(soup_section):
-    """HTML säubern, aber Format (Absätze, <br>, Listen) erhalten"""
-    # Entferne Elemente mit rein organisatorischem Inhalt
-    for tag in soup_section.find_all(
+def clean_description_container(container):
+    """Bereinigt HTML, behält aber Formatierung."""
+    for tag in container.find_all(
         ["script", "style", "picture", "figure", "header", "footer"], recursive=True
     ):
         tag.decompose()
 
-    # Unnötige Inline-Styles und Klassen weg
-    for tag in soup_section.find_all(True):
-        tag.attrs = {k: v for k, v in tag.attrs.items() if k in ["href", "src"]}
+    for tag in container.find_all(True):
+        tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
 
-    # Entferne reine Termin-/Bankblöcke
-    for bad in soup_section.find_all(
-        string=re.compile(r"(Zeiten|Anzahl|Leitung|Nummer|Ort|Preis|Bankverbindung)", re.I)
+    for block in container.find_all(
+        string=re.compile(r"\b(Zeiten|Preis|Nummer|Leitung|Ort|Bankverbindung)\b", re.I)
     ):
-        bad_parent = bad.find_parent(["div", "p", "li"])
-        if bad_parent:
-            bad_parent.decompose()
+        parent = block.find_parent(["div", "p", "li"]) or block.parent
+        if hasattr(parent, "decompose"):
+            parent.decompose()
 
-    # Rückgabe mit erhaltenem HTML
-    html_str = soup_section.decode_contents()
-    html_str = re.sub(r"\s+\n", "\n", html_str)
-    return html_str.strip()
+    html_text = container.decode_contents().strip()
+    return re.sub(r"\s+\n", "\n", html_text)
+
+
+def collect_description(soup):
+    """Fasst relevante Inhaltsblöcke zusammen."""
+    selectors = [
+        "div.VeranstaltungInhalt",
+        "div.VeranstaltungBeschreibung",
+        "section.veranstaltungInhalt",
+    ]
+    sections = []
+    for selector in selectors:
+        sections.extend(soup.select(selector))
+
+    if not sections:
+        return ""
+
+    merged_html = "".join(section.decode_contents() for section in sections)
+    wrapper = BeautifulSoup(f"<div>{merged_html}</div>", "html.parser")
+    return clean_description_container(wrapper.div)
+
+
+def split_off_next_label(text, current_label):
+    """Schneidet alles ab, was zu einem nachfolgenden Label gehört."""
+    other_labels = [label for label in LABELS if label != current_label]
+    if not text:
+        return ""
+    pattern = re.compile(rf"\b(?:{'|'.join(other_labels)})\b", re.I)
+    match = pattern.search(text)
+    if match:
+        text = text[: match.start()]
+    return text.strip(" -:\n\t ")
+
+
+def find_labeled_value(soup, label):
+    """Sucht Textstellen wie 'Label: Wert' und extrahiert den Wert."""
+    pattern = re.compile(rf"^{label}\s*:?(.*)$", re.I)
+    for tag in soup.find_all(True):
+        text = tag.get_text(" ", strip=True)
+        match = pattern.match(text)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        value = split_off_next_label(value, label)
+        if value:
+            return value
+    return ""
+
+
+def extract_times(soup):
+    """Holt den Zeitenblock aus Termintabellen."""
+    selectors = [
+        "div.veranstaltungTermine",
+        "div.VeranstaltungTermine",
+        "section.veranstaltungTermine",
+        "section.VeranstaltungTermine",
+    ]
+    for selector in selectors:
+        container = soup.select_one(selector)
+        if container:
+            for tag in container.find_all(["script", "style", "picture", "figure"], recursive=True):
+                tag.decompose()
+            text = container.get_text(" ", strip=True)
+            text = re.sub(r"\s{2,}", " ", text)
+            return text.strip()
+
+    page_text = soup.get_text(" ", strip=True)
+    match = re.search(r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?=\b(?:Preis|Nummer|Leitung|Ort)\b|$)", page_text)
+    return match.group(1).strip() if match else ""
 
 
 def parse_course(url):
-    """Einzelne Kursseite scrapen"""
+    """Extrahiert Felder aus einer Kursseite."""
     html = fetch(url)
     if not html:
         return None
 
     soup = BeautifulSoup(html, "html.parser")
-    kurs = {}
+    course = {}
 
-    # GUID aus URL
-    m = re.search(r"(cmx[0-9a-f]+)\.html", url, re.I)
-    kurs["guid"] = m.group(1) if m else ""
+    guid_match = re.search(r"(cmx[0-9a-f]+)\.html", url, re.I)
+    course["guid"] = guid_match.group(1) if guid_match else ""
 
-    # Titel
     title_tag = soup.find(["h1", "h2"])
-    kurs["titel"] = title_tag.get_text(strip=True) if title_tag else "Ohne Titel"
+    course["titel"] = title_tag.get_text(strip=True) if title_tag else "Ohne Titel"
 
-    # --- Beschreibung (mehrere Abschnitte zusammenführen) ---
-    content_sections = soup.select(
-        "div.VeranstaltungInhalt, div.VeranstaltungBeschreibung, "
-        "div.textbereich, section.veranstaltungInhalt"
-    )
-    beschreibung_html = ""
-    if content_sections:
-        merged = BeautifulSoup("<div></div>", "html.parser")
-        container = merged.div
-        for section in content_sections:
-            for child in section.contents:
-                container.append(child)
-        beschreibung_html = clean_html_keep_format(container)
+    course["beschreibung"] = collect_description(soup)
 
-    kurs["beschreibung"] = beschreibung_html
-
-    # --- Bild ---
-    bild_tag = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
-    if bild_tag:
-        src = bild_tag.get("src")
-        kurs["bild"] = src if src.startswith("http") else BASE_URL + src
+    image_tag = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
+    if image_tag:
+        src = image_tag.get("src", "")
+        course["bild"] = src if src.startswith("http") else BASE_URL + src
     else:
-        kurs["bild"] = ""
+        course["bild"] = ""
 
-    # --- Textinhalt für Metadaten ---
-    text = soup.get_text(" ", strip=True)
+    for label in LABELS:
+        course[label.lower()] = find_labeled_value(soup, label)
 
-    def extract_field(label):
-        m = re.search(rf"{label}\s*:? ([^\n\r]+)", text, re.I)
-        return m.group(1).strip() if m else ""
+    course["dozent"] = course.pop("leitung", "")
 
-    kurs["nummer"] = extract_field("Nummer")
-    kurs["dozent"] = extract_field("Leitung")
-    kurs["ort"] = extract_field("Ort")
-    kurs["preis"] = extract_field("Preis")
+    course["zeiten"] = extract_times(soup)
 
-    # --- Zeiten ---
-    m = re.search(r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?:Preis|Leitung|Nummer|$)", text, re.S)
-    kurs["zeiten"] = m.group(1).strip() if m else ""
+    guid_ref = re.search(r"f_veranstaltung-(cmx[0-9a-f]+)", html)
+    if guid_ref:
+        signup_guid = guid_ref.group(1)
+    else:
+        signup_guid = course["guid"]
+    course["link"] = (
+        f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{signup_guid}" if signup_guid else ""
+    )
 
-    # --- Anmeldelink ---
-    m = re.search(r"f_veranstaltung-(cmx[0-9a-f]+)", html)
-    guid = m.group(1) if m else kurs["guid"]
-    kurs["link"] = f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{guid}"
+    print(f"✅ {course['titel']}")
+    return course
 
-    print(f"✅ {kurs['titel']}")
-    return kurs
+
+def iterate_courses(urls):
+    """Läuft über alle Übersichtsseiten und parst Kurse."""
+    courses = []
+    seen = set()
+
+    for overview_url in urls:
+        print(f"🔎 Lade Übersicht: {overview_url}")
+        overview_html = fetch(overview_url)
+        if not overview_html:
+            continue
+
+        course_links = extract_course_links(overview_html)
+        print(f"Gefundene Kurse: {len(course_links)}")
+
+        for link in course_links:
+            if link in seen:
+                continue
+            seen.add(link)
+            course = parse_course(link)
+            if course:
+                courses.append(course)
+            time.sleep(1.5)
+    return courses
 
 
 def main():
-    print(f"🔎 Lade Übersicht: {SEARCH_URL}")
-    html = fetch(SEARCH_URL)
-    if not html:
-        print("❌ Fehler: Übersicht nicht abrufbar.")
-        return
+    """Steuert den gesamten Ablauf und speichert kurse.json."""
+    courses = iterate_courses(OVERVIEW_URLS)
 
-    kurs_links = extract_course_links(html)
-    print(f"Gefundene Kurse: {len(kurs_links)}")
+    with open("kurse.json", "w", encoding="utf-8") as handle:
+        json.dump(courses, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
 
-    result = []
-    for link in kurs_links:
-        kurs = parse_course(link)
-        if kurs:
-            result.append(kurs)
-        time.sleep(1.5)  # etwas Pause
-
-    with open("kurse.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    print(f"\n💾 {len(result)} Kurse gespeichert in 'kurse.json'.")
+    print(f"\n💾 {len(courses)} Kurse gespeichert in 'kurse.json'.")
 
 
 if __name__ == "__main__":
