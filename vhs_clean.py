@@ -2,7 +2,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
@@ -303,7 +303,7 @@ def format_times_summary(cell: Tag) -> List[str]:
     return list(iter_stripped_strings(cell))
 
 
-def format_times_details(cell: Tag) -> Tuple[List[str], Optional[str]]:
+def format_times_details(cell: Tag) -> Tuple[List[Dict[str, str]], Optional[str]]:
     header: Optional[str] = None
     summary_tag = cell.find("summary")
     if summary_tag:
@@ -311,10 +311,10 @@ def format_times_details(cell: Tag) -> Tuple[List[str], Optional[str]]:
         if summary_text:
             header = f"Termine ({summary_text})"
 
-    detail_lines: List[str] = []
+    detail_items: List[Dict[str, str]] = []
     table = cell.find("table")
     if not table:
-        return detail_lines, header
+        return detail_items, header
 
     for row in table.find_all("tr"):
         cells = row.find_all("td")
@@ -336,38 +336,123 @@ def format_times_details(cell: Tag) -> Tuple[List[str], Optional[str]]:
         if len(cells) > 1:
             location_text = " ".join(iter_stripped_strings(cells[1]))
 
-        line_parts: List[str] = []
-        if date_text and time_text:
-            line_parts.append(f"{date_text}, {time_text}")
-        elif date_text:
-            line_parts.append(date_text)
-        elif time_text:
-            line_parts.append(time_text)
-
-        extra_parts: List[str] = []
+        item: Dict[str, str] = {}
+        if date_text:
+            item["date"] = date_text
+        if time_text:
+            item["time"] = time_text
         if status_text:
-            extra_parts.append(status_text)
+            item["status"] = status_text
         if location_text:
-            extra_parts.append(location_text)
+            item["location"] = location_text
 
-        core_text = line_parts[0] if line_parts else ""
-        if extra_parts:
-            joiner = " – ".join(extra_parts)
-            core_text = f"{core_text} – {joiner}" if core_text else joiner
+        if item:
+            detail_items.append(item)
 
-        if core_text:
-            detail_lines.append(f"- {core_text}")
-
-    return detail_lines, header
+    return detail_items, header
 
 
-def extract_times(soup: BeautifulSoup) -> str:
-    table = soup.select_one("table.layoutgrid")
-    if not table:
+def build_times_detail_text(item: Dict[str, str]) -> str:
+    date_text = item.get("date", "")
+    time_text = item.get("time", "")
+
+    leading_parts: List[str] = []
+    if date_text and time_text:
+        leading_parts.append(f"{date_text}, {time_text}")
+    elif date_text:
+        leading_parts.append(date_text)
+    elif time_text:
+        leading_parts.append(time_text)
+
+    extra_parts: List[str] = []
+    if item.get("status"):
+        extra_parts.append(item["status"])
+    if item.get("location"):
+        extra_parts.append(item["location"])
+
+    core_text = leading_parts[0] if leading_parts else ""
+    if extra_parts:
+        extras = " – ".join(extra_parts)
+        core_text = f"{core_text} – {extras}" if core_text else extras
+
+    return f"- {core_text}" if core_text else ""
+
+
+def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[str, str]], heading: Optional[str]) -> str:
+    if not summary_lines and not detail_items:
         return ""
 
+    soup = BeautifulSoup("", "html.parser")
+    container = soup.new_tag("div", attrs={"class": "vhs-times"})
+
+    if summary_lines:
+        summary_grid = soup.new_tag("div", attrs={"class": "vhs-times-summary-grid"})
+        for line in summary_lines:
+            item = soup.new_tag("div", attrs={"class": "vhs-times-summary-item"})
+            item.string = line
+            summary_grid.append(item)
+        container.append(summary_grid)
+
+    if detail_items:
+        heading_text = heading or "Termine"
+        heading_tag = soup.new_tag("div", attrs={"class": "vhs-times-heading"})
+        heading_tag.string = heading_text
+        container.append(heading_tag)
+
+        table_wrapper = soup.new_tag("div", attrs={"class": "vhs-times-table-wrapper"})
+        table = soup.new_tag("table", attrs={"class": "vhs-times-table"})
+        tbody = soup.new_tag("tbody")
+
+        for detail in detail_items:
+            row = soup.new_tag("tr")
+
+            datetime_cell = soup.new_tag("td", attrs={"class": "vhs-times-col-datetime"})
+            date_value = detail.get("date")
+            time_value = detail.get("time")
+            if date_value:
+                date_span = soup.new_tag("span", attrs={"class": "vhs-times-date"})
+                date_span.string = date_value
+                datetime_cell.append(date_span)
+            if time_value:
+                if datetime_cell.contents:
+                    datetime_cell.append(soup.new_tag("br"))
+                time_span = soup.new_tag("span", attrs={"class": "vhs-times-time"})
+                time_span.string = time_value
+                datetime_cell.append(time_span)
+
+            info_cell = soup.new_tag("td", attrs={"class": "vhs-times-col-info"})
+            info_parts: List[str] = []
+            if detail.get("location"):
+                info_parts.append(detail["location"])
+            if detail.get("status"):
+                info_parts.append(detail["status"])
+
+            if info_parts:
+                for index, part in enumerate(info_parts):
+                    if index > 0:
+                        info_cell.append(soup.new_tag("br"))
+                    span = soup.new_tag("span")
+                    span.string = part
+                    info_cell.append(span)
+
+            row.append(datetime_cell)
+            row.append(info_cell)
+            tbody.append(row)
+
+        table.append(tbody)
+        table_wrapper.append(table)
+        container.append(table_wrapper)
+
+    return container.decode()
+
+
+def extract_times(soup: BeautifulSoup) -> Dict[str, str]:
+    table = soup.select_one("table.layoutgrid")
+    if not table:
+        return {"text": "", "html": ""}
+
     summary_lines: List[str] = []
-    detail_lines: List[str] = []
+    detail_items: List[Dict[str, str]] = []
     header: Optional[str] = None
 
     for row in table.find_all("tr"):
@@ -385,20 +470,25 @@ def extract_times(soup: BeautifulSoup) -> str:
             summary_lines.extend(format_times_summary(value_cell))
         elif key in {"anzahl", "termine"}:
             details, candidate_header = format_times_details(value_cell)
-            detail_lines.extend(details)
+            detail_items.extend(details)
             if candidate_header and not header:
                 header = candidate_header
 
     table.decompose()
 
-    sections: List[str] = []
+    text_sections: List[str] = []
     if summary_lines:
-        sections.append("\n".join(summary_lines))
-    if detail_lines:
-        heading = header or "Termine"
-        sections.append(f"{heading}\n" + "\n".join(detail_lines))
+        text_sections.append("\n".join(summary_lines))
+    if detail_items:
+        detail_lines = [line for line in (build_times_detail_text(item) for item in detail_items) if line]
+        if detail_lines:
+            heading = header or "Termine"
+            text_sections.append(f"{heading}\n" + "\n".join(detail_lines))
 
-    return "\n\n".join(section for section in sections if section).strip()
+    text_value = "\n\n".join(section for section in text_sections if section).strip()
+    html_value = build_times_html(summary_lines, detail_items, header)
+
+    return {"text": text_value, "html": html_value}
 
 
 def extract_description(soup: BeautifulSoup, title: str) -> str:
@@ -419,14 +509,22 @@ def process_course(course: dict) -> dict:
     course_copy["beschreibung_raw"] = raw_html
 
     soup = BeautifulSoup(raw_html, "html.parser") if raw_html else BeautifulSoup("", "html.parser")
-    times_text = extract_times(soup)
+    times_payload = extract_times(soup)
     description = extract_description(soup, course.get("titel", ""))
 
     course_copy["beschreibung"] = description
+    times_text = times_payload.get("text", "")
+    times_html = times_payload.get("html", "")
+
     if times_text:
         course_copy["zeiten"] = times_text
     else:
         course_copy["zeiten"] = normalize_whitespace(course.get("zeiten", ""))
+
+    if times_html:
+        course_copy["zeiten_html"] = times_html
+    elif "zeiten_html" in course_copy:
+        del course_copy["zeiten_html"]
 
     return course_copy
 

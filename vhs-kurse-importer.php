@@ -358,6 +358,7 @@ function vhs_import_kurse($json_source = null) {
         $nummer_raw = vhs_get_first_value($kurs, ['nummer', 'kursnummer', 'id', 'code']);
         $ort_raw = vhs_get_first_value($kurs, ['ort', 'standort', 'location', 'raum']);
         $zeiten_raw = vhs_get_first_value($kurs, ['zeiten', 'zeit', 'termine', 'zeitraum', 'dauer']);
+        $zeiten_html_raw = vhs_get_first_value($kurs, ['zeiten_html']);
         $bild_raw = vhs_get_first_value($kurs, ['bild', 'bild_url', 'image', 'image_url', 'thumbnail']);
 
         $post_title = sanitize_text_field($title_raw ?: 'Ohne Titel');
@@ -398,7 +399,21 @@ function vhs_import_kurse($json_source = null) {
         update_post_meta($post_id, 'vhs_preis', sanitize_text_field($preis_raw));
         update_post_meta($post_id, 'vhs_nummer', sanitize_text_field($nummer_raw));
         update_post_meta($post_id, 'vhs_ort', sanitize_text_field($ort_raw));
-        update_post_meta($post_id, 'vhs_zeiten', sanitize_text_field($zeiten_raw));
+
+        $zeiten_value = sanitize_textarea_field($zeiten_raw);
+        if ($zeiten_value !== '') {
+            update_post_meta($post_id, 'vhs_zeiten', $zeiten_value);
+        } else {
+            delete_post_meta($post_id, 'vhs_zeiten');
+        }
+
+        $zeiten_html_value = wp_kses_post((string) $zeiten_html_raw);
+        if ($zeiten_html_value !== '') {
+            update_post_meta($post_id, 'vhs_zeiten_html', $zeiten_html_value);
+        } else {
+            delete_post_meta($post_id, 'vhs_zeiten_html');
+        }
+
         update_post_meta($post_id, 'vhs_bild', esc_url_raw($bild_raw));
 
         if (!empty($bild_raw)) {
@@ -584,12 +599,25 @@ function vhs_render_field_markup($key, $label, $value) {
     $has_label = $label !== null && $label !== '';
 
     if ($key === 'vhs_zeiten') {
+        global $post;
+        $label_html = $has_label ? '<strong>' . esc_html($label) . ':</strong>' : '';
+
+        $html_meta = '';
+        if (is_object($post) && isset($post->ID)) {
+            $raw_html = get_post_meta($post->ID, 'vhs_zeiten_html', true);
+            if (!empty($raw_html)) {
+                $html_meta = wp_kses_post($raw_html);
+            }
+        }
+
+        if ($html_meta !== '') {
+            return '<div class="vhs-field vhs-field-times">' . $label_html . '<div class="vhs-times-content">' . $html_meta . '</div></div>';
+        }
+
         $formatted = vhs_format_times_html($value);
         if ($formatted === '') {
             return '';
         }
-
-        $label_html = $has_label ? '<strong>' . esc_html($label) . ':</strong>' : '';
 
         return '<div class="vhs-field vhs-field-times">' . $label_html . '<div class="vhs-times-content">' . $formatted . '</div></div>';
     }
@@ -623,12 +651,20 @@ add_action('wp_enqueue_scripts', function() {
 .vhs-field strong{min-width:6.5rem;display:inline-block;font-weight:600;color:var(--ct-primary,#333);}
 .vhs-field-times{margin:0.9rem 0 0.8rem;}
 .vhs-field-times strong{display:block;margin-bottom:0.4rem;min-width:auto;}
-.vhs-times-content{display:flex;flex-direction:column;gap:0.45rem;}
-.vhs-times-summary{display:flex;flex-wrap:wrap;gap:0.35rem;padding:0;margin:0;list-style:none;font-size:0.9rem;}
-.vhs-times-summary li{background:rgba(0,0,0,0.05);border-radius:999px;padding:0.25rem 0.7rem;}
+.vhs-times-content{display:flex;flex-direction:column;gap:0.6rem;}
+.vhs-times-summary,.vhs-times-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0.4rem;padding:0;margin:0;list-style:none;font-size:0.9rem;}
+.vhs-times-summary li,.vhs-times-summary-item{border:1px solid rgba(0,0,0,0.08);border-radius:10px;padding:0.45rem 0.75rem;background:var(--ct-background-light,#f8f9fa);line-height:1.35;}
 .vhs-times-heading{font-weight:600;color:var(--ct-primary,#333);font-size:0.92rem;}
-.vhs-times-details{margin:0.2rem 0 0;padding-left:1.15rem;}
-.vhs-times-details li{margin:0.2rem 0;}
+.vhs-times-table-wrapper{border:1px solid rgba(0,0,0,0.08);border-radius:12px;overflow:hidden;}
+.vhs-times-table{width:100%;border-collapse:collapse;font-size:0.9rem;}
+.vhs-times-table td{padding:0.6rem 0.8rem;vertical-align:top;border-top:1px solid rgba(0,0,0,0.05);}
+.vhs-times-table tr:first-child td{border-top:none;}
+.vhs-times-col-datetime{min-width:8.5rem;}
+.vhs-times-date{font-weight:600;color:var(--ct-primary,#333);}
+.vhs-times-time{color:rgba(0,0,0,0.7);}
+.vhs-times-col-info span{display:block;}
+.vhs-times-details{margin:0;padding-left:1.1rem;}
+.vhs-times-details li{margin:0.25rem 0;}
 .vhs-button{display:inline-block;margin-top:1rem;background:var(--ct-primary,#0073aa);color:#fff;padding:0.6rem 1.2rem;border-radius:8px;text-decoration:none;font-weight:600;transition:all 0.2s ease-in-out;}
 .vhs-button:hover{background:var(--ct-primary-hover,#005b85);transform:translateY(-1px);}
 ");
