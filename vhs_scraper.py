@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Scraper für Kursangebote der VHS Lahnstein."""
 
+import argparse
 import json
 import re
 import time
+import traceback
+import os
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -24,6 +27,12 @@ HEADERS = {
 
 LABELS = ["Nummer", "Leitung", "Ort", "Preis"]
 
+DEBUG_MODE = False
+
+
+# ---------------------------------------------------------------------------
+# Netzwerk
+# ---------------------------------------------------------------------------
 
 def fetch(url):
     """Lädt HTML mit Headern und einfachem Retry."""
@@ -42,6 +51,10 @@ def fetch(url):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Übersicht → Kurslinks
+# ---------------------------------------------------------------------------
+
 def extract_course_links(html):
     """Sammelt Kurslinks von einer Übersichtsseite."""
     soup = BeautifulSoup(html, "html.parser")
@@ -57,50 +70,73 @@ def extract_course_links(html):
     return sorted(set(links))
 
 
+# ---------------------------------------------------------------------------
+# Beschreibung bereinigen (mit Stabilitäts-Fix)
+# ---------------------------------------------------------------------------
+
 def clean_description_container(container, title=None):
     """Bereinigt HTML, behält aber Formatierung."""
-    if container is None:
+    if not isinstance(container, Tag):
         return ""
 
+    # Entferne störende Tags
     for tag in container.find_all(
-        ["script", "style", "picture", "figure", "header", "footer"], recursive=True
+        ["script", "style", "picture", "figure", "header", "footer"],
+        recursive=True
     ):
         tag.decompose()
 
+    # Entferne Blöcke, die Labels enthalten
     for block in container.find_all(
         string=re.compile(r"\b(Zeiten|Preis|Nummer|Leitung|Ort|Bankverbindung)\b", re.I)
     ):
-        parent = block.find_parent(["div", "p", "li", "tr", "table"])
-        if parent is None:
-            parent = block.parent
-        if hasattr(parent, "decompose"):
+        parent = block.find_parent(["div", "p", "li", "tr", "table"]) or block.parent
+        if isinstance(parent, Tag):
             parent.decompose()
 
+    # Tabellen entfernen (robuster)
     for table in list(container.find_all("table")):
         if not isinstance(table, Tag):
             continue
-        classes = table.get("class", [])
-        if "layoutgrid" in classes or table.find("label"):
-            table.decompose()
-    for table in list(container.find_all("table")):
-        if not isinstance(table, Tag):
-            continue
-        if not table.get_text(strip=True):
-            table.decompose()
 
+        classes = table.get("class", []) or []
+
+        if "layoutgrid" in classes:
+            table.decompose()
+            continue
+
+        if table.find("label"):
+            table.decompose()
+            continue
+
+        try:
+            if not table.get_text(strip=True):
+                table.decompose()
+                continue
+        except Exception:
+            table.decompose()
+            continue
+
+    # Unerwünschte Attribute entfernen
     for tag in container.find_all(True):
-        tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
+        if isinstance(tag, Tag):
+            tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
 
+    # Titel entfernen (falls doppelt)
     if title:
         normalized_title = re.sub(r"\s+", " ", title).strip().lower()
         for heading in container.find_all(["h1", "h2"]):
-            heading_text = re.sub(r"\s+", " ", heading.get_text(strip=True)).lower()
-            if heading_text == normalized_title:
+            txt = re.sub(r"\s+", " ", heading.get_text(strip=True)).lower()
+            if txt == normalized_title:
                 heading.decompose()
 
     html_text = container.decode_contents().strip()
     return re.sub(r"\s+\n", "\n", html_text)
 
+
+# ---------------------------------------------------------------------------
+# Beschreibung sammeln (mit Fallback)
+# ---------------------------------------------------------------------------
 
 def collect_description(soup, title=None):
     """Fasst relevante Inhaltsblöcke zusammen."""
@@ -113,8 +149,10 @@ def collect_description(soup, title=None):
         "div.Text.Detail",
         "main#content div.Text",
     ]
+
     sections = []
     seen = set()
+
     for selector in primary_selectors:
         for node in soup.select(selector):
             if id(node) in seen:
@@ -132,7 +170,11 @@ def collect_description(soup, title=None):
             if sections:
                 break
 
+    # Letzter Fallback: main/content/body
     if not sections:
+        fallback = soup.select_one("main, #content, body")
+        if fallback:
+            return clean_description_container(fallback, title=title)
         return ""
 
     merged_html = "".join(section.decode_contents() for section in sections)
@@ -140,11 +182,15 @@ def collect_description(soup, title=None):
     return clean_description_container(wrapper.div, title=title)
 
 
+# ---------------------------------------------------------------------------
+# Label-Extraktion
+# ---------------------------------------------------------------------------
+
 def split_off_next_label(text, current_label):
-    """Schneidet alles ab, was zu einem nachfolgenden Label gehört."""
     other_labels = [label for label in LABELS if label != current_label]
     if not text:
         return ""
+
     pattern = re.compile(rf"\b(?:{'|'.join(other_labels)})\b", re.I)
     match = pattern.search(text)
     if match:
@@ -153,7 +199,6 @@ def split_off_next_label(text, current_label):
 
 
 def find_labeled_value(soup, label):
-    """Sucht Textstellen wie 'Label: Wert' und extrahiert den Wert."""
     pattern = re.compile(rf"^{label}\s*:?(.*)$", re.I)
     for tag in soup.find_all(True):
         text = tag.get_text(" ", strip=True)
@@ -167,34 +212,100 @@ def find_labeled_value(soup, label):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Zeiten
+# ---------------------------------------------------------------------------
+
 def extract_times(soup):
-    """Holt den Zeitenblock aus Termintabellen."""
     selectors = [
         "div.veranstaltungTermine",
         "div.VeranstaltungTermine",
         "section.veranstaltungTermine",
         "section.VeranstaltungTermine",
     ]
-    for selector in selectors:
-        container = soup.select_one(selector)
-        if container:
-            for tag in container.find_all(["script", "style", "picture", "figure"], recursive=True):
+    for sel in selectors:
+        c = soup.select_one(sel)
+        if c:
+            for tag in c.find_all(["script", "style", "picture", "figure"], recursive=True):
                 tag.decompose()
-            text = container.get_text(" ", strip=True)
+            text = c.get_text(" ", strip=True)
             text = re.sub(r"\s{2,}", " ", text)
             return text.strip()
 
-    table_value = find_labeled_value(soup, "Zeiten")
-    if table_value:
-        return table_value
+    value = find_labeled_value(soup, "Zeiten")
+    if value:
+        return value
 
     page_text = soup.get_text(" ", strip=True)
-    match = re.search(r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?=\b(?:Preis|Nummer|Leitung|Ort)\b|$)", page_text)
+    match = re.search(
+        r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?=\b(?:Preis|Nummer|Leitung|Ort)\b|$)",
+        page_text
+    )
     return match.group(1).strip() if match else ""
 
 
+# ---------------------------------------------------------------------------
+# Debug-Logger
+# ---------------------------------------------------------------------------
+
+def log_debug_error(url, html, error, traceback_text, title=None):
+    os.makedirs("debug/html", exist_ok=True)
+
+    guid_match = re.search(r"(cmx[0-9a-f]+)", url, re.I)
+    guid = guid_match.group(1) if guid_match else "unknown"
+
+    html_path = f"debug/html/{guid}.html"
+
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html or "")
+    except Exception:
+        pass
+
+    entry = {
+        "url": url,
+        "guid": guid,
+        "title": title,
+        "error": str(error),
+        "traceback": traceback_text,
+        "html_file": html_path,
+    }
+
+    with open("debug/errors.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Parse-Safe Wrapper
+# ---------------------------------------------------------------------------
+
+def parse_course_safe(url, debug=False):
+    try:
+        html = fetch(url)
+        if not html:
+            raise RuntimeError("Seite konnte nicht geladen werden")
+
+        soup = BeautifulSoup(html, "html.parser")
+        title_tag = soup.find(["h1", "h2"])
+        pre_title = title_tag.get_text(strip=True) if title_tag else None
+
+        return parse_course(url)
+
+    except Exception as err:
+        print(f"❌ Fehler beim Kurs: {url}")
+        tb = traceback.format_exc()
+
+        if debug:
+            log_debug_error(url, html if "html" in locals() else None, err, tb, title=pre_title)
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Regulierer Parser
+# ---------------------------------------------------------------------------
+
 def parse_course(url):
-    """Extrahiert Felder aus einer Kursseite."""
     html = fetch(url)
     if not html:
         return None
@@ -210,9 +321,9 @@ def parse_course(url):
 
     course["beschreibung"] = collect_description(soup, title=course["titel"])
 
-    image_tag = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
-    if image_tag:
-        src = image_tag.get("src", "")
+    img = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
+    if img:
+        src = img.get("src", "")
         course["bild"] = src if src.startswith("http") else BASE_URL + src
     else:
         course["bild"] = ""
@@ -221,24 +332,24 @@ def parse_course(url):
         course[label.lower()] = find_labeled_value(soup, label)
 
     course["dozent"] = course.pop("leitung", "")
-
     course["zeiten"] = extract_times(soup)
 
     guid_ref = re.search(r"f_veranstaltung-(cmx[0-9a-f]+)", html)
-    if guid_ref:
-        signup_guid = guid_ref.group(1)
-    else:
-        signup_guid = course["guid"]
+    signup_guid = guid_ref.group(1) if guid_ref else course["guid"]
     course["link"] = (
-        f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{signup_guid}" if signup_guid else ""
+        f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{signup_guid}"
+        if signup_guid else ""
     )
 
     print(f"✅ {course['titel']}")
     return course
 
 
+# ---------------------------------------------------------------------------
+# Kursiteration
+# ---------------------------------------------------------------------------
+
 def iterate_courses(urls):
-    """Läuft über alle Übersichtsseiten und parst Kurse."""
     courses = []
     seen = set()
 
@@ -255,22 +366,45 @@ def iterate_courses(urls):
             if link in seen:
                 continue
             seen.add(link)
-            course = parse_course(link)
+
+            course = parse_course_safe(link, debug=DEBUG_MODE)
             if course:
                 courses.append(course)
+
             time.sleep(1.5)
+
     return courses
 
 
+# ---------------------------------------------------------------------------
+# CLI / Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="VHS Kurs-Scraper")
+    parser.add_argument("--debug", action="store_true",
+                        help="Speichert HTML & Fehlerlogs, bricht nie ab.")
+    parser.add_argument("--output", default="kurse.json",
+                        help="Ziel-Datei (default: kurse.json)")
+    return parser.parse_args()
+
+
 def main():
-    """Steuert den gesamten Ablauf und speichert kurse.json."""
+    global DEBUG_MODE
+
+    args = parse_args()
+    DEBUG_MODE = args.debug
+
+    if DEBUG_MODE:
+        print("🐞 Debug-Modus aktiviert")
+
     courses = iterate_courses(OVERVIEW_URLS)
 
-    with open("kurse.json", "w", encoding="utf-8") as handle:
-        json.dump(courses, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(courses, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
-    print(f"\n💾 {len(courses)} Kurse gespeichert in 'kurse.json'.")
+    print(f"\n💾 {len(courses)} Kurse gespeichert in '{args.output}'.")
 
 
 if __name__ == "__main__":
