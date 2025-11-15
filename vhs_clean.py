@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
 """
 Clean-Skript für VHS-Kurse.
-Nimmt die rohen Scraper-Daten und bereinigt sie für die Weiterverarbeitung.
+Bereinigt die vom Scraper erzeugte kurse.json und schreibt kurse.clean.json.
 """
 
 import json
-import argparse
+import sys
 import re
 from bs4 import BeautifulSoup
 
+# -------------------------------------------------------------
+# Helferfunktionen
+# -------------------------------------------------------------
 
 def clean_html(html):
-    """Bereinigt HTML von Müll, ohne echte Inhalte zu zerstören."""
+    """Bereinigt HTML von unnötigem Müll, ohne echten Inhalt zu verlieren."""
     if not html:
         return ""
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Entferne offensichtliche Müll-Tags
-    for tag in soup.find_all(["script", "style", "header", "footer", "picture", "figure"]):
+    # Offensichtlicher Müll
+    for tag in soup.find_all(["script", "style", "picture", "figure", "header", "footer"]):
         tag.decompose()
 
-    # Entferne leere Container
+    # Leere Container entfernen
     for div in soup.find_all("div"):
         if not div.get_text(strip=True):
             div.decompose()
 
-    # Entferne doppelte Leerzeichen & Zeilenumbrüche
+    # Extrahiere reinen Text
     text = soup.get_text("\n", strip=True)
+
+    # Mehrfache Zeilenumbrüche reduzieren
     text = re.sub(r"\n\s*\n+", "\n\n", text)
+
+    # Mehrfache Leerzeichen entfernen
     text = re.sub(r"[ \t]+", " ", text)
 
     return text.strip()
@@ -37,35 +44,30 @@ def clean_html(html):
 def normalize_price(price):
     if not price:
         return ""
-    price = price.strip()
-    price = price.replace("€", "").replace("EUR", "")
-    return price.strip()
+    price = price.replace("€", "").replace("EUR", "").strip()
+    return price
 
 
 def normalize_times(zeiten):
     if not zeiten:
         return ""
-    z = re.sub(r"\s+", " ", zeiten)
-    return z.strip()
+    z = re.sub(r"\s+", " ", zeiten).strip()
+    return z
 
 
 def normalize_title(title):
     if not title:
         return ""
-    title = title.strip()
-    title = re.sub(r"\s+", " ", title)
-    return title
+    return re.sub(r"\s+", " ", title.strip())
 
 
 def process_course(course):
     """Bereinigt ein einzelnes Kursobjekt."""
-
     cleaned = course.copy()
 
     cleaned["titel"] = normalize_title(course.get("titel", ""))
     cleaned["beschreibung_raw"] = course.get("beschreibung", "")
 
-    # erzeugt ein bereinigtes Beschreibungstextfeld
     cleaned["beschreibung"] = clean_html(course.get("beschreibung", ""))
 
     cleaned["preis"] = normalize_price(course.get("preis", ""))
@@ -76,24 +78,28 @@ def process_course(course):
     return cleaned
 
 
+# -------------------------------------------------------------
+# Main
+# -------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Bereinigt VHS-Kurse JSON.")
-    parser.add_argument("--input", default="kurse.json")
-    parser.add_argument("--output", default="kurse_clean.json")
-    args = parser.parse_args()
+    if len(sys.argv) != 3:
+        print("❌ Aufruf: python vhs_clean.py input.json output.json")
+        sys.exit(1)
 
-    print(f"📥 Lade {args.input} ...")
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
 
-    with open(args.input, "r", encoding="utf-8") as f:
+    print(f"📥 Lade {input_file} ...")
+
+    with open(input_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    cleaned = []
-    for c in data:
-        cleaned.append(process_course(c))
+    cleaned = [process_course(c) for c in data]
 
-    print(f"💾 Speichere bereinigte Daten nach {args.output} ...")
+    print(f"💾 Speichere bereinigte Datei nach {output_file} ...")
 
-    with open(args.output, "w", encoding="utf-8") as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         json.dump(cleaned, f, ensure_ascii=False, indent=2)
 
     print(f"✅ Fertig! {len(cleaned)} Kurse bereinigt.")
