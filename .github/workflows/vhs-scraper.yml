@@ -103,7 +103,7 @@ jobs:
           echo "Clean Script erfolgreich – Vorschau:"
           head -n 20 kurse.clean.json
 
-      # ----------------------------------------------------------------------
+            # ----------------------------------------------------------------------
       # COMMIT & PUSH (korrekt)
       # ----------------------------------------------------------------------
       - name: Commit & Push results
@@ -125,3 +125,6 @@ jobs:
           fi
 
           git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
+
+          exit 0
+
