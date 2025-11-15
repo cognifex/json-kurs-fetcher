@@ -595,6 +595,76 @@ function vhs_split_heading_parts($heading) {
     return [$heading, ''];
 }
 
+function vhs_parse_detail_line_simple($line) {
+    $line = trim((string) $line);
+    if ($line === '') {
+        return null;
+    }
+
+    // z.B. "Fr 05.12.2025 · 16:00 - 19:15 Uhr"
+    $segments = array_map('trim', explode('·', $line));
+
+    $weekday   = '';
+    $date_raw  = '';
+    $date_text = '';
+    $time_text = '';
+
+    foreach ($segments as $segment) {
+        if ($segment === '') {
+            continue;
+        }
+
+        // Wochentag-Kürzel
+        if ($weekday === '' && preg_match('/^(Mo|Di|Mi|Do|Fr|Sa|So)\b/u', $segment, $m)) {
+            $weekday = $m[1];
+        }
+
+        // Datum
+        if ($date_raw === '' && preg_match('/(\d{1,2}\.\d{1,2}\.\d{4})/u', $segment, $m)) {
+            $date_raw = $m[1];
+        }
+
+        // Zeitspanne
+        if ($time_text === '' && preg_match('/(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})/u', $segment, $m)) {
+            // Einheitliches Format: 16:00–19:15 Uhr
+            $time_text = $m[1] . '–' . $m[2] . ' Uhr';
+        }
+    }
+
+    if ($weekday !== '' && $date_raw !== '') {
+        $date_text = $weekday . ' ' . $date_raw;
+    } elseif ($date_raw !== '') {
+        $date_text = $date_raw;
+    }
+
+    if ($date_text === '' && $time_text === '') {
+        return null;
+    }
+
+    return [
+        'date_raw'  => $date_raw,
+        'date_text' => $date_text,
+        'time_text' => $time_text,
+    ];
+}
+
+function vhs_extract_pause_note($summary_lines) {
+    $note = '';
+
+    foreach ($summary_lines as $line) {
+        if (stripos($line, 'pause') !== false) {
+            if (preg_match('/(\d+\s*Min\.\s*Pause)/i', $line, $m)) {
+                // Standardisiere zu "jeweils X Min. Pause"
+                $note = 'jeweils ' . $m[1];
+            } else {
+                $note = trim($line);
+            }
+        }
+    }
+
+    return $note;
+}
+
 function vhs_build_compact_times($details) {
     $compact = [];
 
@@ -670,119 +740,114 @@ function vhs_detect_status_class($status_text) {
 function vhs_format_times_html($value, $course_location = '') {
     [$summary, $heading, $details] = vhs_parse_times_value($value);
 
-    if (empty($summary) && empty($details)) {
+    // Falls keine Details erkannt wurden, alles als Details behandeln
+    if (empty($details) && !empty($summary)) {
+        $details = $summary;
+        $summary = [];
+    }
+
+    if (empty($details)) {
         return '';
     }
 
-    $has_details = !empty($details);
-    $compact_items = $has_details ? vhs_build_compact_times($details) : [];
+    $items      = [];
+    $all_dates  = [];
 
-    $html = '<div class="vhs-times">';
-
-    if (!empty($compact_items)) {
-        $html .= '<div class="vhs-times-compact">';
-        $html .= '<span class="vhs-times-compact-label">Termine</span>';
-        $html .= '<div class="vhs-times-compact-list">';
-        foreach ($compact_items as $item) {
-            $text = vhs_prettify_summary_line($item);
-            if ($text === '') {
-                continue;
-            }
-            $html .= '<span class="vhs-times-compact-item">' . esc_html($text) . '</span>';
+    foreach ($details as $line) {
+        // ggf. führendes "- " entfernen
+        $line = ltrim($line, "- \t");
+        $parsed = vhs_parse_detail_line_simple($line);
+        if (!$parsed) {
+            continue;
         }
-        $html .= '</div>';
+
+        $items[] = $parsed;
+
+        if ($parsed['date_raw'] !== '') {
+            $all_dates[] = $parsed['date_raw'];
+        }
+    }
+
+    if (empty($items)) {
+        return '';
+    }
+
+    // Anzahl Termine/Abende
+    $count = count($items);
+
+    // Versuch, "4 Tage", "3 Abende" etc. aus der ersten Summary-Zeile zu übernehmen
+    $unit_word      = '';
+    $explicit_count = null;
+
+    if (!empty($summary)) {
+        if (preg_match('/(\d+)\s+([A-Za-zÄÖÜäöüß]+)/u', $summary[0], $m)) {
+            $explicit_count = (int) $m[1];
+            $unit_word      = $m[2]; // "Tage", "Abende" usw.
+        }
+    }
+
+    if ($explicit_count !== null) {
+        $count = $explicit_count;
+    }
+
+    if ($unit_word === '') {
+        $unit_word = ($count === 1) ? 'Termin' : 'Abende';
+    }
+
+    // Datumsbereich bestimmen
+    $range_text = '';
+    if (!empty($all_dates)) {
+        $dates = [];
+        foreach ($all_dates as $d) {
+            $dt = DateTime::createFromFormat('d.m.Y', $d);
+            if ($dt instanceof DateTime) {
+                $dates[] = $dt;
+            }
+        }
+        if (!empty($dates)) {
+            usort($dates, fn($a, $b) => $a <=> $b);
+            $first = $dates[0];
+            $last  = $dates[count($dates) - 1];
+
+            if ($first->format('m.Y') === $last->format('m.Y')) {
+                // 05.–13.12.2025
+                $range_text = $first->format('d.') . '–' . $last->format('d.m.Y');
+            } elseif ($first->format('Y') === $last->format('Y')) {
+                // 25.11.–02.12.2025
+                $range_text = $first->format('d.m.') . '–' . $last->format('d.m.Y');
+            } else {
+                // 10.12.2025–15.01.2026
+                $range_text = $first->format('d.m.Y') . '–' . $last->format('d.m.Y');
+            }
+        }
+    }
+
+    $header = $count . ' ' . $unit_word;
+    if ($range_text !== '') {
+        $header .= ' · ' . $range_text;
+    }
+
+    // Pausen-Hinweis aus Summary-Zeilen
+    $pause_note = vhs_extract_pause_note($summary);
+
+    // HTML-Ausgabe
+    $html  = '<div class="vhs-times vhs-times-simple">';
+    $html .= '<div class="vhs-times-simple-header">' . esc_html($header) . '</div>';
+    $html .= '<div class="vhs-times-simple-label">Termine</div>';
+
+    foreach ($items as $item) {
+        $html .= '<div class="vhs-times-simple-item">';
+        if ($item['date_text'] !== '') {
+            $html .= '<div class="vhs-times-simple-date">' . esc_html($item['date_text']) . '</div>';
+        }
+        if ($item['time_text'] !== '') {
+            $html .= '<div class="vhs-times-simple-time">' . esc_html($item['time_text']) . '</div>';
+        }
         $html .= '</div>';
     }
 
-    if (!empty($summary) || $has_details) {
-        $html .= '<details class="vhs-times-details">';
-        $html .= '<summary class="vhs-times-details-summary">'
-              . '<span class="vhs-times-details-summary-label">Details anzeigen</span>'
-              . '<span class="vhs-times-details-caret" aria-hidden="true"></span>'
-              . '</summary>';
-        $html .= '<div class="vhs-times-expanded">';
-
-        if (!empty($summary)) {
-            $html .= '<div class="vhs-times-summary-grid">';
-            foreach ($summary as $line) {
-                $text = vhs_prettify_summary_line($line);
-                if ($text === '') {
-                    continue;
-                }
-                $html .= '<div class="vhs-times-summary-item">' . esc_html($text) . '</div>';
-            }
-            $html .= '</div>';
-        }
-
-        if ($has_details) {
-            [$heading_label, $heading_badge] = vhs_split_heading_parts($heading);
-            $html .= '<div class="vhs-times-heading"><span class="vhs-times-heading-label">' . esc_html($heading_label) . '</span>';
-            if ($heading_badge !== '') {
-                $html .= '<span class="vhs-times-count">' . esc_html($heading_badge) . '</span>';
-            }
-            $html .= '</div>';
-            $html .= '<ul class="vhs-times-list">';
-            foreach ($details as $line) {
-                $line = trim($line);
-                if ($line === '') {
-                    continue;
-                }
-                $segments = array_map('trim', explode('·', $line));
-                $date = '';
-                $time = '';
-                $status = '';
-                $location_parts = [];
-
-                foreach ($segments as $segment) {
-                    if ($segment === '') {
-                        continue;
-                    }
-
-                    if ($date === '' && preg_match('/^(Mo|Di|Mi|Do|Fr|Sa|So)\s/i', $segment)) {
-                        $date = $segment;
-                        continue;
-                    }
-
-                    if ($time === '' && preg_match('/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/', $segment)) {
-                        $time = $segment;
-                        continue;
-                    }
-
-                    if ($status === '' && preg_match('/abgesagt|ausgebucht|belegt/i', $segment)) {
-                        $status = $segment;
-                        continue;
-                    }
-
-                    $location_parts[] = $segment;
-                }
-
-                $location = trim(implode(' · ', $location_parts));
-                if ($location !== '' && vhs_normalise_location($location) === vhs_normalise_location($course_location)) {
-                    $location = '';
-                }
-
-                $html .= '<li class="vhs-times-list-item">';
-                if ($date !== '') {
-                    $html .= '<span class="vhs-times-date">' . esc_html($date) . '</span>';
-                }
-                if ($time !== '') {
-                    $html .= '<span class="vhs-times-time">' . esc_html($time) . '</span>';
-                }
-                if ($location !== '') {
-                    $html .= '<span class="vhs-times-location">' . esc_html($location) . '</span>';
-                }
-                if ($status !== '') {
-                    $class = vhs_detect_status_class($status);
-                    $status_html = '<span class="vhs-times-status' . ($class !== '' ? ' ' . $class : '') . '">' . esc_html($status) . '</span>';
-                    $html .= $status_html;
-                }
-                $html .= '</li>';
-            }
-            $html .= '</ul>';
-        }
-
-        $html .= '</div>';
-        $html .= '</details>';
+    if ($pause_note !== '') {
+        $html .= '<div class="vhs-times-simple-note">' . esc_html($pause_note) . '</div>';
     }
 
     $html .= '</div>';
@@ -795,25 +860,16 @@ function vhs_render_field_markup($key, $label, $value) {
 
     if ($key === 'vhs_zeiten') {
         global $post;
+        $has_label = $label !== null && $label !== '';
         $label_html = $has_label ? '<strong>' . esc_html($label) . ':</strong>' : '';
-
-        $html_meta = '';
-        if (is_object($post) && isset($post->ID)) {
-            $raw_html = get_post_meta($post->ID, 'vhs_zeiten_html', true);
-            if (!empty($raw_html)) {
-                $html_meta = wp_kses_post($raw_html);
-            }
-        }
 
         $course_location = '';
         if (is_object($post) && isset($post->ID)) {
             $course_location = get_post_meta($post->ID, 'vhs_ort', true);
         }
 
-        if ($html_meta !== '') {
-            return '<div class="vhs-field vhs-field-times">' . $label_html . '<div class="vhs-times-content">' . $html_meta . '</div></div>';
-        }
-
+        // Wichtig: vhs_zeiten_html NICHT mehr direkt verwenden,
+        // sondern immer unser eigenes Format aus vhs_zeiten generieren.
         $formatted = vhs_format_times_html($value, $course_location);
         if ($formatted === '') {
             return '';
@@ -881,6 +937,13 @@ add_action('wp_enqueue_scripts', function() {
 .vhs-button{display:inline-block;margin-top:1rem;background:var(--ct-primary,#0073aa);color:#fff;padding:0.6rem 1.2rem;border-radius:8px;text-decoration:none;font-weight:600;transition:all 0.2s ease-in-out;}
 .vhs-button:hover{background:var(--ct-primary-hover,#005b85);transform:translateY(-1px);}
 @media (max-width:600px){.vhs-times-compact{flex-direction:column;align-items:flex-start;}.vhs-times-list-item{grid-template-columns:repeat(2,minmax(0,1fr));row-gap:0.3rem;} .vhs-times-location{grid-column:1/-1;} .vhs-times-status{justify-self:start;}}
+.vhs-times-simple-header{font-weight:600;font-size:0.95rem;margin-bottom:0.4rem;}
+.vhs-times-simple-label{font-weight:600;font-size:0.8rem;text-transform:uppercase;letter-spacing:0.06em;margin:0.4rem 0 0.3rem;}
+.vhs-times-simple-item{margin-bottom:0.45rem;}
+.vhs-times-simple-date,
+.vhs-times-simple-time{display:block;/* erzwingt zwei Zeilen, auch bei viel Breite */font-size:0.9rem;}
+.vhs-times-simple-date{font-weight:600;}
+.vhs-times-simple-note{margin-top:0.4rem;font-size:0.8rem;}
 ");
 });
 
