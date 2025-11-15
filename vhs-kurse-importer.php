@@ -423,6 +423,97 @@ function vhs_render_last_result($result) {
 }
 
 // --- Shortcode für Felder ---
+function vhs_parse_times_value($value) {
+    $value = trim((string) $value);
+    if ($value === '') {
+        return [[], '', []];
+    }
+
+    $lines = preg_split("/\n+/", $value);
+    $lines = array_values(array_filter(array_map('trim', $lines), function($line) {
+        return $line !== '';
+    }));
+
+    $summary = [];
+    $heading = '';
+    $details = [];
+    $in_details = false;
+
+    foreach ($lines as $line) {
+        if (!$in_details && preg_match('/^termine/i', $line)) {
+            $heading = $line;
+            $in_details = true;
+            continue;
+        }
+
+        if ($in_details) {
+            $details[] = ltrim(preg_replace('/^-\s*/', '', $line));
+        } else {
+            $summary[] = $line;
+        }
+    }
+
+    return [$summary, $heading, $details];
+}
+
+function vhs_format_times_html($value) {
+    [$summary, $heading, $details] = vhs_parse_times_value($value);
+
+    if (empty($summary) && empty($details)) {
+        return '';
+    }
+
+    $html = '<div class="vhs-times">';
+
+    if (!empty($summary)) {
+        $html .= '<ul class="vhs-times-summary">';
+        foreach ($summary as $line) {
+            $html .= '<li>' . esc_html($line) . '</li>';
+        }
+        $html .= '</ul>';
+    }
+
+    if (!empty($heading)) {
+        $html .= '<div class="vhs-times-heading">' . esc_html($heading) . '</div>';
+    }
+
+    if (!empty($details)) {
+        $html .= '<ul class="vhs-times-details">';
+        foreach ($details as $line) {
+            if ($line === '') {
+                continue;
+            }
+            $html .= '<li>' . esc_html($line) . '</li>';
+        }
+        $html .= '</ul>';
+    }
+
+    $html .= '</div>';
+
+    return $html;
+}
+
+function vhs_render_field_markup($key, $label, $value) {
+    $has_label = $label !== null && $label !== '';
+
+    if ($key === 'vhs_zeiten') {
+        $formatted = vhs_format_times_html($value);
+        if ($formatted === '') {
+            return '';
+        }
+
+        $label_html = $has_label ? '<strong>' . esc_html($label) . ':</strong>' : '';
+
+        return '<div class="vhs-field vhs-field-times">' . $label_html . '<div class="vhs-times-content">' . $formatted . '</div></div>';
+    }
+
+    if ($has_label) {
+        return '<p class="vhs-field"><strong>' . esc_html($label) . ':</strong> ' . esc_html($value) . '</p>';
+    }
+
+    return '<p class="vhs-field">' . esc_html($value) . '</p>';
+}
+
 add_shortcode('vhs_field', function($atts) {
     $atts = shortcode_atts(['key' => '', 'label' => ''], $atts);
     if (empty($atts['key'])) return '';
@@ -430,8 +521,8 @@ add_shortcode('vhs_field', function($atts) {
     if (!$post) return '';
     $value = get_post_meta($post->ID, $atts['key'], true);
     if (!$value) return '';
-    $label_html = $atts['label'] ? '<strong>' . esc_html($atts['label']) . ':</strong> ' : '';
-    return '<p class="vhs-field">' . $label_html . esc_html($value) . '</p>';
+
+    return vhs_render_field_markup($atts['key'], $atts['label'], $value);
 });
 
 // --- Automatisches CSS laden ---
@@ -443,6 +534,14 @@ add_action('wp_enqueue_scripts', function() {
 .vhs-field-box h3{font-size:1.1rem;margin-bottom:0.8rem;border-bottom:1px solid rgba(0,0,0,0.05);padding-bottom:0.4rem;}
 .vhs-field{margin:0.3rem 0;font-size:0.95rem;line-height:1.5;}
 .vhs-field strong{min-width:6.5rem;display:inline-block;font-weight:600;color:var(--ct-primary,#333);}
+.vhs-field-times{margin:0.9rem 0 0.8rem;}
+.vhs-field-times strong{display:block;margin-bottom:0.4rem;min-width:auto;}
+.vhs-times-content{display:flex;flex-direction:column;gap:0.45rem;}
+.vhs-times-summary{display:flex;flex-wrap:wrap;gap:0.35rem;padding:0;margin:0;list-style:none;font-size:0.9rem;}
+.vhs-times-summary li{background:rgba(0,0,0,0.05);border-radius:999px;padding:0.25rem 0.7rem;}
+.vhs-times-heading{font-weight:600;color:var(--ct-primary,#333);font-size:0.92rem;}
+.vhs-times-details{margin:0.2rem 0 0;padding-left:1.15rem;}
+.vhs-times-details li{margin:0.2rem 0;}
 .vhs-button{display:inline-block;margin-top:1rem;background:var(--ct-primary,#0073aa);color:#fff;padding:0.6rem 1.2rem;border-radius:8px;text-decoration:none;font-weight:600;transition:all 0.2s ease-in-out;}
 .vhs-button:hover{background:var(--ct-primary-hover,#005b85);transform:translateY(-1px);}
 ");
@@ -462,7 +561,11 @@ add_shortcode('vhs_widget', function() {
     $html = '<div class="vhs-field-box"><h3>Kurs-Information</h3>';
     foreach ($fields as $key => $label) {
         $val = get_post_meta($post->ID, $key, true);
-        if ($val) $html .= '<p class="vhs-field"><strong>' . $label . ':</strong> ' . esc_html($val) . '</p>';
+        if (!$val) continue;
+        $field_markup = vhs_render_field_markup($key, $label, $val);
+        if ($field_markup) {
+            $html .= $field_markup;
+        }
     }
     $link = get_post_meta($post->ID, 'vhs_link', true);
     if ($link) {
