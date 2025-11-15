@@ -6,7 +6,7 @@ import re
 import time
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 BASE_URL = "https://vhs-lahnstein.de"
 OVERVIEW_URLS = [
@@ -67,9 +67,6 @@ def clean_description_container(container, title=None):
     ):
         tag.decompose()
 
-    for tag in container.find_all(True):
-        tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
-
     for block in container.find_all(
         string=re.compile(r"\b(Zeiten|Preis|Nummer|Leitung|Ort|Bankverbindung)\b", re.I)
     ):
@@ -80,16 +77,19 @@ def clean_description_container(container, title=None):
             parent.decompose()
 
     for table in list(container.find_all("table")):
-        if not hasattr(table, "get"):
+        if not isinstance(table, Tag):
             continue
         classes = table.get("class", [])
         if "layoutgrid" in classes or table.find("label"):
             table.decompose()
     for table in list(container.find_all("table")):
-        if not hasattr(table, "get_text"):
+        if not isinstance(table, Tag):
             continue
         if not table.get_text(strip=True):
             table.decompose()
+
+    for tag in container.find_all(True):
+        tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
 
     if title:
         normalized_title = re.sub(r"\s+", " ", title).strip().lower()
