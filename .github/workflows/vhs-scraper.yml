@@ -3,7 +3,7 @@ name: VHS Lahnstein Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 5 * * *'
+    - cron: '0 5 * * *' # Jeden Tag um 05:00 UTC
 
 permissions:
   contents: write
@@ -14,11 +14,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ----------------------------------------------------------------------
+      # REPO CHECKOUT
+      # ----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      # ----------------------------------------------------------------------
+      # PYTHON SETUP
+      # ----------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -29,20 +35,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || echo "Keine requirements.txt – überspringe."
 
-      # ------------------------------------------------------------
-      # 1. Normaler Scraper-Lauf, Log speichern
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------------------
+      # SCRAPER AUSFÜHREN (NORMAL)
+      # ----------------------------------------------------------------------
       - name: Run scraper (normal)
-        id: run1
+        id: run_scraper
         run: |
           echo "Starte VHS-Scraper (normal)..."
           python vhs_scraper.py --output kurse.json 2>&1 | tee scraper.log || true
 
-      # ------------------------------------------------------------
-      # 2. Debug-Bedingung: Fehler im Log ODER JSON leer
-      # ------------------------------------------------------------
-      - name: Prüfe auf Fehler und leere JSON
-        id: check
+      # Prüfen, ob Fehler im Log oder Datei leer
+      - name: Prüfe Scraper-Ergebnis
+        id: scraper_check
         run: |
           if grep -q "Fehler" scraper.log; then
             echo "debug=true" >> "$GITHUB_OUTPUT"
@@ -52,51 +56,68 @@ jobs:
             echo "debug=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ------------------------------------------------------------
-      # 3. Debug-Lauf falls nötig
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------------------
+      # DEBUG SCRAPER (falls nötig)
+      # ----------------------------------------------------------------------
       - name: Run scraper (DEBUG)
-        if: steps.check.outputs.debug == 'true'
+        if: steps.scraper_check.outputs.debug == 'true'
         run: |
           echo "⚠ Fehler erkannt – starte Debug-Modus..."
           python vhs_scraper.py --debug --output kurse.json || true
 
-      # ------------------------------------------------------------
-      # 4. Debug-Ordner als Artifact hochladen
-      # ------------------------------------------------------------
+      # Debug-Artefakte hochladen
       - name: Upload Debug Artifacts
-        if: steps.check.outputs.debug == 'true'
+        if: steps.scraper_check.outputs.debug == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: vhs-debug-artifacts
           path: debug
           if-no-files-found: warn
 
-      # ------------------------------------------------------------
-      # 5. kurse.json validieren
-      # ------------------------------------------------------------
-      - name: Prüfe JSON
+      # ----------------------------------------------------------------------
+      # JSON VORHANDEN?
+      # ----------------------------------------------------------------------
+      - name: Prüfe JSON nach Scraper
         run: |
           if [ ! -s kurse.json ]; then
-            echo "❌ JSON weiterhin leer – Abbruch."
+            echo "❌ Scraper erzeugte keine Daten – Abbruch."
             exit 1
           fi
-          echo "Vorschau auf kurse.json:"
+          echo "Scraper erfolgreich – Vorschau:"
           head -n 20 kurse.json
 
-      # ------------------------------------------------------------
-      # 6. Commit changes
-      # ------------------------------------------------------------
-      - name: Commit and push changes
+      # ----------------------------------------------------------------------
+      # CLEAN SCRIPT AUSFÜHREN
+      # ----------------------------------------------------------------------
+      - name: Run Clean Script
+        run: |
+          echo "Starte Clean Script..."
+          python vhs_clean.py kurse.json kurse.clean.json
+
+      - name: Prüfe Clean Script Output
+        run: |
+          if [ ! -s kurse.clean.json ]; then
+            echo "❌ Clean Script erzeugte keine gültige Datei – Abbruch."
+            exit 1
+          fi
+          echo "Clean Script erfolgreich – Vorschau:"
+          head -n 20 kurse.clean.json
+
+      # ----------------------------------------------------------------------
+      # COMMIT DER BEREINIGTEN VERSION
+      # ----------------------------------------------------------------------
+      - name: Commit cleaned JSON
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add kurse.json
+
+          git add kurse.clean.json
+
           if git diff --cached --quiet; then
             echo "Keine Änderungen – nichts zu committen."
           else
-            git commit -m "🔄 Update Kurse ($(date +'%Y-%m-%d %H:%M:%S'))"
+            git commit -m "🔄 Update Kurse Clean ($(date +'%Y-%m-%d %H:%M:%S'))"
             git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
           fi
