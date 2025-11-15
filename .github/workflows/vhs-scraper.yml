@@ -29,12 +29,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt || echo "Keine requirements.txt – überspringe."
 
+      # ------------------------------------------------------------
+      # 1. Scraper normal ausführen
+      # ------------------------------------------------------------
       - name: Run scraper (normal)
         id: run1
         run: |
           echo "Starte VHS-Scraper (normal)..."
           python vhs_scraper.py --output kurse.json || true
 
+      # ------------------------------------------------------------
+      # 2. Ergebnis prüfen: ist JSON leer?
+      # ------------------------------------------------------------
       - name: Prüfe Ergebnis nach Run 1
         id: check1
         run: |
@@ -44,6 +50,9 @@ jobs:
             echo "empty=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # ------------------------------------------------------------
+      # 3. Debug-Run NUR wenn JSON leer ist
+      # ------------------------------------------------------------
       - name: Run scraper (DEBUG, falls nötig)
         if: steps.check1.outputs.empty == 'true'
         id: run2
@@ -51,6 +60,9 @@ jobs:
           echo "⚠ Erstes Ergebnis leer – starte Debug-Modus..."
           python vhs_scraper.py --debug --output kurse.json || true
 
+      # ------------------------------------------------------------
+      # 4. Debug-Dateien als Artifact hochladen
+      # ------------------------------------------------------------
       - name: Upload Debug Artifacts (HTML + Logs)
         if: steps.check1.outputs.empty == 'true'
         uses: actions/upload-artifact@v4
@@ -59,6 +71,9 @@ jobs:
           path: debug
           if-no-files-found: warn
 
+      # ------------------------------------------------------------
+      # 5. JSON final prüfen (auch nach Debug-Lauf)
+      # ------------------------------------------------------------
       - name: Prüfe JSON erneut (auch nach Debug)
         run: |
           if [ ! -s kurse.json ]; then
@@ -68,6 +83,9 @@ jobs:
           echo "Vorschau auf kurse.json:"
           head -n 20 kurse.json
 
+      # ------------------------------------------------------------
+      # 6. Änderungen committen und pushen
+      # ------------------------------------------------------------
       - name: Commit and push changes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
