@@ -20,7 +20,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true   # <-- wichtig, sonst kein Push
+          persist-credentials: true   # wichtig für Push
 
       # ----------------------------------------------------------------------
       # PYTHON SETUP
@@ -104,22 +104,24 @@ jobs:
           head -n 20 kurse.clean.json
 
       # ----------------------------------------------------------------------
-      # COMMIT & PUSH
+      # COMMIT & PUSH (korrekt)
       # ----------------------------------------------------------------------
       - name: Commit & Push results
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Dateien zum Commit hinzufügen
           git add kurse.json kurse.clean.json scraper.log || true
 
+          # Prüfen, ob Änderungen existieren
           if git diff --cached --quiet; then
-            echo "Keine Änderungen – commit wird trotzdem erzwungen."
-            git commit -m "Update: Scrape & Clean (forced)" --allow-empty
+            echo "Keine Änderungen – erzwinge leeren Commit."
+            git commit -m "🔄 Update (forced)" --allow-empty
           else
-            git commit -m "Update: Scrape & Clean"
+            git commit -m "🔄 Update Kursdaten ($(date +'%Y-%m-%d %H:%M:%S'))"
           fi
 
-          git push
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
