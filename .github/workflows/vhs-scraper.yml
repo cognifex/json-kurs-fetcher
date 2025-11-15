@@ -3,7 +3,7 @@ name: VHS Lahnstein Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 5 * * *' # Jeden Tag um 05:00 UTC
+    - cron: '0 5 * * *'
 
 permissions:
   contents: write
@@ -30,41 +30,42 @@ jobs:
           pip install -r requirements.txt || echo "Keine requirements.txt – überspringe."
 
       # ------------------------------------------------------------
-      # 1. Scraper normal ausführen
+      # 1. Normaler Scraper-Lauf, Log speichern
       # ------------------------------------------------------------
       - name: Run scraper (normal)
         id: run1
         run: |
           echo "Starte VHS-Scraper (normal)..."
-          python vhs_scraper.py --output kurse.json || true
+          python vhs_scraper.py --output kurse.json 2>&1 | tee scraper.log || true
 
       # ------------------------------------------------------------
-      # 2. Ergebnis prüfen: ist JSON leer?
+      # 2. Debug-Bedingung: Fehler im Log ODER JSON leer
       # ------------------------------------------------------------
-      - name: Prüfe Ergebnis nach Run 1
-        id: check1
+      - name: Prüfe auf Fehler und leere JSON
+        id: check
         run: |
-          if [ ! -s kurse.json ]; then
-            echo "empty=true" >> "$GITHUB_OUTPUT"
+          if grep -q "Fehler" scraper.log; then
+            echo "debug=true" >> "$GITHUB_OUTPUT"
+          elif [ ! -s kurse.json ]; then
+            echo "debug=true" >> "$GITHUB_OUTPUT"
           else
-            echo "empty=false" >> "$GITHUB_OUTPUT"
+            echo "debug=false" >> "$GITHUB_OUTPUT"
           fi
 
       # ------------------------------------------------------------
-      # 3. Debug-Run NUR wenn JSON leer ist
+      # 3. Debug-Lauf falls nötig
       # ------------------------------------------------------------
-      - name: Run scraper (DEBUG, falls nötig)
-        if: steps.check1.outputs.empty == 'true'
-        id: run2
+      - name: Run scraper (DEBUG)
+        if: steps.check.outputs.debug == 'true'
         run: |
-          echo "⚠ Erstes Ergebnis leer – starte Debug-Modus..."
+          echo "⚠ Fehler erkannt – starte Debug-Modus..."
           python vhs_scraper.py --debug --output kurse.json || true
 
       # ------------------------------------------------------------
-      # 4. Debug-Dateien als Artifact hochladen
+      # 4. Debug-Ordner als Artifact hochladen
       # ------------------------------------------------------------
-      - name: Upload Debug Artifacts (HTML + Logs)
-        if: steps.check1.outputs.empty == 'true'
+      - name: Upload Debug Artifacts
+        if: steps.check.outputs.debug == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: vhs-debug-artifacts
@@ -72,9 +73,9 @@ jobs:
           if-no-files-found: warn
 
       # ------------------------------------------------------------
-      # 5. JSON final prüfen (auch nach Debug-Lauf)
+      # 5. kurse.json validieren
       # ------------------------------------------------------------
-      - name: Prüfe JSON erneut (auch nach Debug)
+      - name: Prüfe JSON
         run: |
           if [ ! -s kurse.json ]; then
             echo "❌ JSON weiterhin leer – Abbruch."
@@ -84,7 +85,7 @@ jobs:
           head -n 20 kurse.json
 
       # ------------------------------------------------------------
-      # 6. Änderungen committen und pushen
+      # 6. Commit changes
       # ------------------------------------------------------------
       - name: Commit and push changes
         env:
