@@ -1,0 +1,243 @@
+<?php
+/**
+ * Plugin Name: VHS-Kurse Importer Extended
+ * Description: Importiert und synchronisiert Kursdaten aus einer JSON-Datei. Erstellt und aktualisiert automatisch Kurse, setzt Beitragsbilder (mit sicherem Download), deaktiviert nicht mehr vorhandene Kurse und zeigt automatisch einen „Jetzt anmelden“-Button im Widget an.
+ * Version: 1.4
+ * Author: Tim Heimes / Cognifaktur
+ */
+
+if (!defined('ABSPATH')) exit;
+
+define('VHS_POST_TYPE', 'vhs_kurs');
+
+// --- CPT registrieren ---
+add_action('init', function() {
+    register_post_type(VHS_POST_TYPE, [
+        'labels' => [
+            'name' => 'Kurse',
+            'singular_name' => 'Kurs',
+            'add_new_item' => 'Neuen Kurs hinzufügen',
+            'edit_item' => 'Kurs bearbeiten',
+        ],
+        'public' => true,
+        'has_archive' => true,
+        'menu_icon' => 'dashicons-welcome-learn-more',
+        'supports' => ['title', 'editor', 'thumbnail', 'custom-fields'],
+        'show_in_rest' => true,
+    ]);
+});
+
+// --- JSON Upload erlauben ---
+add_filter('upload_mimes', fn($m) => array_merge($m, ['json' => 'application/json', 'svg' => 'image/svg+xml', 'webp' => 'image/webp']));
+
+// --- Admin-Menü ---
+add_action('admin_menu', function() {
+    add_menu_page('VHS-Kurse', 'VHS-Kurse', 'manage_options', 'vhs-kurse', 'vhs_kurse_admin_page', 'dashicons-update');
+    add_submenu_page('vhs-kurse', '⚙️ Custom Fields', '⚙️ Custom Fields', 'manage_options', 'vhs-custom-fields', 'vhs_custom_fields_page');
+});
+
+// --- Admin-Seite: Import ---
+function vhs_kurse_admin_page() {
+    if (isset($_POST['vhs_json_url'])) {
+        update_option('vhs_json_url', esc_url_raw($_POST['vhs_json_url']));
+        echo '<div class="updated"><p>✅ JSON-Quelle gespeichert.</p></div>';
+    }
+
+    if (!empty($_FILES['vhs_json_upload']['tmp_name'])) {
+        $upload = wp_handle_upload($_FILES['vhs_json_upload'], ['test_form' => false]);
+        if (!isset($upload['error'])) {
+            update_option('vhs_uploaded_json', $upload['file']);
+            echo '<div class="updated"><p>✅ Datei hochgeladen: ' . esc_html(basename($upload['file'])) . '</p></div>';
+        } else {
+            echo '<div class="error"><p>Fehler: ' . esc_html($upload['error']) . '</p></div>';
+        }
+    }
+
+    if (isset($_POST['vhs_import_now'])) {
+        $source = get_option('vhs_uploaded_json') ?: get_option('vhs_json_url');
+        vhs_import_kurse($source);
+        echo '<div class="updated"><p>✅ Import abgeschlossen.</p></div>';
+    }
+
+    $saved_url = esc_attr(get_option('vhs_json_url', ''));
+    $uploaded_file = esc_html(basename(get_option('vhs_uploaded_json', 'Keine Datei')));
+
+    echo '<div class="wrap"><h1>VHS-Kurse Import</h1>
+        <form method="post" enctype="multipart/form-data">
+            <h2>1️⃣ JSON-URL</h2>
+            <p><input type="url" name="vhs_json_url" value="' . $saved_url . '" size="60"> ';
+    submit_button('Speichern', 'secondary', 'save_json_url', false);
+    echo '</p><h2>2️⃣ Oder lokale Datei</h2>
+            <input type="file" name="vhs_json_upload" accept=".json">
+            <p>Aktuelle Datei: <code>' . $uploaded_file . '</code></p>';
+    submit_button('Datei hochladen', 'secondary', 'upload_json', false);
+    echo '<h2>3️⃣ Import starten</h2>';
+    submit_button('Jetzt importieren', 'primary', 'vhs_import_now');
+    echo '</form></div>';
+}
+
+// --- Cronjob täglich ---
+if (!wp_next_scheduled('vhs_import_cron')) {
+    wp_schedule_event(time(), 'daily', 'vhs_import_cron');
+}
+add_action('vhs_import_cron', 'vhs_import_kurse');
+
+// --- Hauptimporter mit sicherem Bild-Download ---
+function vhs_import_kurse($json_source = null) {
+    if (!$json_source) $json_source = get_option('vhs_json_url');
+    if (!$json_source) return;
+
+    if (filter_var($json_source, FILTER_VALIDATE_URL)) {
+        $response = wp_remote_get($json_source);
+        if (is_wp_error($response)) return;
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+    } else {
+        $data = json_decode(file_get_contents($json_source), true);
+    }
+    if (!$data || !is_array($data)) return;
+
+    $found_guids = [];
+
+    foreach ($data as $kurs) {
+        $guid = sanitize_text_field($kurs['guid'] ?? '');
+        if (!$guid) continue;
+        $found_guids[] = $guid;
+
+        $existing = get_posts([
+            'post_type' => VHS_POST_TYPE,
+            'meta_key' => 'vhs_guid',
+            'meta_value' => $guid,
+            'numberposts' => 1
+        ]);
+
+        $post_data = [
+            'post_title' => sanitize_text_field($kurs['titel'] ?? 'Ohne Titel'),
+            'post_content' => wp_kses_post($kurs['beschreibung'] ?? ''),
+            'post_type' => VHS_POST_TYPE,
+            'post_status' => 'publish'
+        ];
+
+        $post_id = $existing ? $existing[0]->ID : wp_insert_post($post_data);
+        if ($existing) {
+            $post_data['ID'] = $post_id;
+            wp_update_post($post_data);
+        }
+
+        // Meta aktualisieren
+        update_post_meta($post_id, 'vhs_guid', $guid);
+        update_post_meta($post_id, 'vhs_link', esc_url_raw($kurs['link'] ?? ''));
+        update_post_meta($post_id, 'vhs_dozent', sanitize_text_field($kurs['dozent'] ?? ''));
+        update_post_meta($post_id, 'vhs_preis', sanitize_text_field($kurs['preis'] ?? ''));
+        update_post_meta($post_id, 'vhs_nummer', sanitize_text_field($kurs['nummer'] ?? ''));
+        update_post_meta($post_id, 'vhs_ort', sanitize_text_field($kurs['ort'] ?? ''));
+        update_post_meta($post_id, 'vhs_zeiten', sanitize_text_field($kurs['zeiten'] ?? ''));
+        update_post_meta($post_id, 'vhs_bild', esc_url_raw($kurs['bild'] ?? ''));
+
+        // --- Sicherer Bild-Download (funktioniert auch bei IONOS) ---
+        if (!empty($kurs['bild'])) {
+            $image_url = esc_url_raw($kurs['bild']);
+            $image_name = basename(parse_url($image_url, PHP_URL_PATH));
+            $upload_dir = wp_upload_dir();
+
+            $response = wp_remote_get($image_url, ['timeout' => 20]);
+            if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+                $image_data = wp_remote_retrieve_body($response);
+                $file_path = $upload_dir['path'] . '/' . $image_name;
+                file_put_contents($file_path, $image_data);
+
+                $file_type = wp_check_filetype($image_name, null);
+                $attachment = [
+                    'post_mime_type' => $file_type['type'],
+                    'post_title'     => sanitize_file_name(pathinfo($image_name, PATHINFO_FILENAME)),
+                    'post_content'   => '',
+                    'post_status'    => 'inherit'
+                ];
+                $attach_id = wp_insert_attachment($attachment, $file_path, $post_id);
+                require_once ABSPATH . 'wp-admin/includes/image.php';
+                $attach_data = wp_generate_attachment_metadata($attach_id, $file_path);
+                wp_update_attachment_metadata($attach_id, $attach_data);
+                set_post_thumbnail($post_id, $attach_id);
+            } else {
+                error_log('⚠️ Fehler beim Bild-Download: ' . $image_url);
+            }
+        }
+    }
+
+    // --- Alte Kurse deaktivieren ---
+    $all_existing = get_posts(['post_type' => VHS_POST_TYPE, 'numberposts' => -1]);
+    foreach ($all_existing as $p) {
+        $guid = get_post_meta($p->ID, 'vhs_guid', true);
+        if ($guid && !in_array($guid, $found_guids)) {
+            wp_update_post(['ID' => $p->ID, 'post_status' => 'draft']);
+        }
+    }
+}
+
+// --- Shortcode für Felder ---
+add_shortcode('vhs_field', function($atts) {
+    $atts = shortcode_atts(['key' => '', 'label' => ''], $atts);
+    if (empty($atts['key'])) return '';
+    global $post;
+    if (!$post) return '';
+    $value = get_post_meta($post->ID, $atts['key'], true);
+    if (!$value) return '';
+    $label_html = $atts['label'] ? '<strong>' . esc_html($atts['label']) . ':</strong> ' : '';
+    return '<p class="vhs-field">' . $label_html . esc_html($value) . '</p>';
+});
+
+// --- Automatisches CSS laden ---
+add_action('wp_enqueue_scripts', function() {
+    wp_register_style('vhs-kurse-style', false);
+    wp_enqueue_style('vhs-kurse-style');
+    wp_add_inline_style('vhs-kurse-style', "
+.vhs-field-box{background:var(--ct-background-light,#f8f9fa);border:1px solid rgba(0,0,0,0.07);border-radius:12px;padding:1.2rem 1.5rem;margin:1.5rem 0;box-shadow:0 1px 4px rgba(0,0,0,0.04);}
+.vhs-field-box h3{font-size:1.1rem;margin-bottom:0.8rem;border-bottom:1px solid rgba(0,0,0,0.05);padding-bottom:0.4rem;}
+.vhs-field{margin:0.3rem 0;font-size:0.95rem;line-height:1.5;}
+.vhs-field strong{min-width:6.5rem;display:inline-block;font-weight:600;color:var(--ct-primary,#333);}
+.vhs-button{display:inline-block;margin-top:1rem;background:var(--ct-primary,#0073aa);color:#fff;padding:0.6rem 1.2rem;border-radius:8px;text-decoration:none;font-weight:600;transition:all 0.2s ease-in-out;}
+.vhs-button:hover{background:var(--ct-primary-hover,#005b85);transform:translateY(-1px);}
+");
+});
+
+// --- Automatischer Widget-Block ---
+add_shortcode('vhs_widget', function() {
+    global $post;
+    if (!$post) return '';
+    $fields = [
+        'vhs_zeiten' => '🕓 Zeiten',
+        'vhs_dozent' => '👤 Leitung',
+        'vhs_nummer' => '🔢 Nummer',
+        'vhs_ort'    => '📍 Ort',
+        'vhs_preis'  => '💰 Preis'
+    ];
+    $html = '<div class="vhs-field-box"><h3>Kurs-Information</h3>';
+    foreach ($fields as $key => $label) {
+        $val = get_post_meta($post->ID, $key, true);
+        if ($val) $html .= '<p class="vhs-field"><strong>' . $label . ':</strong> ' . esc_html($val) . '</p>';
+    }
+    $link = get_post_meta($post->ID, 'vhs_link', true);
+    if ($link) {
+        $html .= '<a href="' . esc_url($link) . '" class="vhs-button" target=\"_blank\" rel=\"noopener\">Jetzt anmelden</a>';
+    }
+    $html .= '</div>';
+    return $html;
+});
+
+// --- Feldübersicht im Admin ---
+function vhs_custom_fields_page() {
+    echo '<div class="wrap"><h1>⚙️ VHS-Kurse – Custom Fields</h1><table class="widefat"><thead><tr><th>Feldname</th><th>Beschreibung</th></tr></thead><tbody>';
+    $fields = [
+        'vhs_guid' => 'Eindeutige Kurs-ID',
+        'vhs_link' => 'Anmeldelink',
+        'vhs_dozent' => 'Leitung / Dozent',
+        'vhs_preis' => 'Preis',
+        'vhs_nummer' => 'Kursnummer',
+        'vhs_ort' => 'Ort',
+        'vhs_zeiten' => 'Zeiten',
+        'vhs_bild' => 'Kursbild (URL)'
+    ];
+    foreach ($fields as $key => $label) {
+        echo "<tr><td><code>$key</code></td><td>$label</td></tr>";
+    }
+    echo '</tbody></table></div>';
+}
