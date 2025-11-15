@@ -185,6 +185,9 @@ function vhs_import_kurse($json_source = null) {
     $updated = 0;
     $total = 0;
 
+    $now_local = current_time('mysql');
+    $now_gmt = current_time('mysql', true);
+
     foreach ($data as $kurs) {
         $guid = sanitize_text_field($kurs['guid'] ?? '');
         if (!$guid) continue;
@@ -202,11 +205,16 @@ function vhs_import_kurse($json_source = null) {
             'post_title' => sanitize_text_field($kurs['titel'] ?? 'Ohne Titel'),
             'post_content' => wp_kses_post($kurs['beschreibung'] ?? ''),
             'post_type' => VHS_POST_TYPE,
-            'post_status' => 'publish'
+            'post_status' => 'publish',
+            'post_date' => $now_local,
+            'post_date_gmt' => $now_gmt,
+            'post_modified' => $now_local,
+            'post_modified_gmt' => $now_gmt,
         ];
         $post_id = $existing ? $existing[0]->ID : wp_insert_post($post_data);
         if ($existing) {
             $post_data['ID'] = $post_id;
+            $post_data['edit_date'] = true;
             wp_update_post($post_data);
             $updated++;
         } else {
@@ -311,6 +319,17 @@ function vhs_normalize_json_url($url) {
                 return $normalized;
             }
         }
+        $body = wp_remote_retrieve_body($response);
+    } else {
+        if (!is_readable($json_source)) {
+            return new WP_Error('vhs_file_error', 'Die ausgewählte Datei kann nicht gelesen werden.');
+        }
+        $body = file_get_contents($json_source);
+    }
+
+    $data = json_decode($body, true);
+    if (!is_array($data)) {
+        return new WP_Error('vhs_invalid_json', 'Die JSON-Daten konnten nicht verarbeitet werden.');
     }
 
     return $url;
