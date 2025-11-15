@@ -7,18 +7,20 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-ADMIN_KEYWORDS = {
+ADMIN_ALWAYS_KEYWORDS = {
     "iban",
     "bic",
     "bankverbindung",
     "name der bank",
     "kontoinhaber",
+}
+
+ADMIN_PREFIX_KEYWORDS = {
     "zahlungsbedingungen",
     "teilnahmebedingungen",
     "gebührenordnung",
     "rücktritt",
     "haftung",
-    "datenschutz",
     "zahlung",
 }
 
@@ -214,6 +216,25 @@ def collect_blocks(root: Tag, soup: BeautifulSoup) -> List[Tag]:
     return deduped
 
 
+def is_admin_block(block: Tag, text: str) -> bool:
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if block.name in {"ul", "ol", "li", "table"}:
+        return False
+
+    if any(keyword in lowered for keyword in ADMIN_ALWAYS_KEYWORDS):
+        return True
+
+    normalized = re.sub(r"\s+", " ", lowered).strip()
+    for keyword in ADMIN_PREFIX_KEYWORDS:
+        if normalized.startswith(keyword):
+            return True
+
+    return False
+
+
 def filter_admin_blocks(blocks: Sequence[Tag]) -> List[Tag]:
     filtered: List[Tag] = []
     last_text: Optional[str] = None
@@ -221,8 +242,7 @@ def filter_admin_blocks(blocks: Sequence[Tag]) -> List[Tag]:
         text = normalize_whitespace(block.get_text(" ", strip=True))
         if not text:
             continue
-        lowered = text.lower()
-        if any(keyword in lowered for keyword in ADMIN_KEYWORDS):
+        if is_admin_block(block, text):
             continue
         if last_text == text:
             continue
