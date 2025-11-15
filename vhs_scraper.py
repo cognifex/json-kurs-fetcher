@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scraper für Kursangebote der VHS Lahnstein (Hotfix-Version 2025)."""
+"""Scraper für Kursangebote der VHS Lahnstein – Rohdaten-Version (keine Bereinigung)."""
 
 import argparse
 import json
@@ -12,9 +12,10 @@ import requests
 from bs4 import BeautifulSoup, Tag
 
 BASE_URL = "https://vhs-lahnstein.de"
+
 OVERVIEW_URLS = [
     "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes"
-    "&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnertag=1&Freitag=1&Samstag=1&Sonntag=1",
+    "&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1",
 ]
 
 HEADERS = {
@@ -38,13 +39,13 @@ def fetch(url):
     """Lädt HTML mit Headern und einfachem Retry."""
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            if resp.status_code == 200:
-                return resp.text
-            if resp.status_code == 410:
+            response = requests.get(url, headers=HEADERS, timeout=20)
+            if response.status_code == 200:
+                return response.text
+            if response.status_code == 410:
                 print(f"⚠️ Seite entfernt: {url}")
                 return None
-            print(f"⚠️ Status {resp.status_code} für {url}")
+            print(f"⚠️ Status {response.status_code} für {url}")
         except requests.RequestException as exc:
             print(f"⚠️ Fehler bei Abruf {url}: {exc}")
         time.sleep(1 + attempt)
@@ -52,147 +53,86 @@ def fetch(url):
 
 
 # ---------------------------------------------------------------------------
-# Kurslinks extrahieren
+# Übersicht → Kurslinks
 # ---------------------------------------------------------------------------
 
 def extract_course_links(html):
+    """Sammelt Kurslinks von einer Übersichtsseite."""
     soup = BeautifulSoup(html, "html.parser")
     links = []
-
-    for a in soup.select("a[href*='/Veranstaltung/cmx']"):
-        href = a.get("href")
+    for anchor in soup.select("a[href*='/Veranstaltung/cmx']"):
+        href = anchor.get("href")
         if not href:
             continue
         if not href.startswith("http"):
             href = BASE_URL + href
         if href.endswith(".html"):
             links.append(href)
-
     return sorted(set(links))
 
 
 # ---------------------------------------------------------------------------
-# Beschreibung bereinigen (Hotfix: safe cleaning)
-# ---------------------------------------------------------------------------
-
-def clean_description_container(container, title=None, safe=False):
-    """Bereinigt HTML. safe=True = löscht KEINE Beschreibung anhand von Labels."""
-    if not isinstance(container, Tag):
-        return ""
-
-    # Entferne nur offensichtlichen Müll
-    for tag in container.find_all(["script", "style", "picture", "figure", "header", "footer"]):
-        tag.decompose()
-
-    # Tabellen wie gehabt entfernen
-    for table in list(container.find_all("table")):
-        if not isinstance(table, Tag):
-            continue
-
-        classes = table.get("class", []) or []
-
-        if "layoutgrid" in classes or table.find("label"):
-            table.decompose()
-            continue
-
-        try:
-            if not table.get_text(strip=True):
-                table.decompose()
-        except Exception:
-            table.decompose()
-
-    # Attribute strippen
-    for tag in container.find_all(True):
-        if isinstance(tag, Tag):
-            tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"href", "src"}}
-
-    html_text = container.decode_contents().strip()
-    return re.sub(r"\s+\n", "\n", html_text)
-
-
-# ---------------------------------------------------------------------------
-# Beschreibung sammeln (NEUES VHS-TEMPLATE)
-# ---------------------------------------------------------------------------
-
-def collect_description(soup, title=None):
-    """
-    Neue VHS-Struktur:
-    Beschreibung liegt zuverlässig in:
-        #content div.Text.Detail
-    """
-
-    # 1. Primärer neuer Hotfix-Selector
-    new_selectors = [
-        "#content div.Text.Detail",
-        "div#content div.Text.Detail",
-        "main div.Text.Detail",
-    ]
-
-    for selector in new_selectors:
-        nodes = soup.select(selector)
-        if nodes:
-            merged = "".join(node.decode_contents() for node in nodes)
-            wrapper = BeautifulSoup(f"<div>{merged}</div>", "html.parser")
-            return clean_description_container(wrapper.div, title=title, safe=True)
-
-    # 2. Großer Notfall-Fallback → gesamte Seite durchsuchen
-    fallback = soup.select_one("#content, main, body")
-    if fallback:
-        return clean_description_container(fallback, title=title, safe=True)
-
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# Label-Erkennung (wie vorher)
+# Label-Extraktion (wie gehabt)
 # ---------------------------------------------------------------------------
 
 def split_off_next_label(text, current_label):
-    others = [l for l in LABELS if l != current_label]
+    other_labels = [label for label in LABELS if label != current_label]
     if not text:
         return ""
 
-    pattern = re.compile(rf"\b(?:{'|'.join(others)})\b", re.I)
-    m = pattern.search(text)
-    if m:
-        text = text[:m.start()]
+    pattern = re.compile(rf"\b(?:{'|'.join(other_labels)})\b", re.I)
+    match = pattern.search(text)
+    if match:
+        text = text[: match.start()]
     return text.strip(" -:\n\t ")
 
 
 def find_labeled_value(soup, label):
     pattern = re.compile(rf"^{label}\s*:?(.*)$", re.I)
-
     for tag in soup.find_all(True):
         text = tag.get_text(" ", strip=True)
-        m = pattern.match(text)
-        if not m:
+        match = pattern.match(text)
+        if not match:
             continue
-        value = m.group(1).strip()
+        value = match.group(1).strip()
         value = split_off_next_label(value, label)
         if value:
             return value
-
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Zeiten extrahieren (stabilisiert)
+# Zeiten (unverändert)
 # ---------------------------------------------------------------------------
 
 def extract_times(soup):
-    # Neue VHS-Struktur hat keine "VeranstaltungTermine" mehr
-    # Daher fallback: Finde Datumsblöcke im gesamten Text
-    page = soup.get_text(" ", strip=True)
+    selectors = [
+        "div.veranstaltungTermine",
+        "div.VeranstaltungTermine",
+        "section.veranstaltungTermine",
+        "section.VeranstaltungTermine",
+    ]
+    for sel in selectors:
+        c = soup.select_one(sel)
+        if c:
+            text = c.get_text(" ", strip=True)
+            text = re.sub(r"\s{2,}", " ", text)
+            return text.strip()
 
-    # Beispielmuster: 12.03.2025 19:00–21:00
-    regex = r"\d{1,2}\.\d{2}\.\d{4}.*?(?=\b(?:Preis|Nummer|Leitung|Ort)\b|$)"
-    m = re.search(regex, page)
+    value = find_labeled_value(soup, "Zeiten")
+    if value:
+        return value
 
-    return m.group(0).strip() if m else ""
+    page_text = soup.get_text(" ", strip=True)
+    match = re.search(
+        r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?=\b(?:Preis|Nummer|Leitung|Ort)\b|$)",
+        page_text
+    )
+    return match.group(1).strip() if match else ""
 
 
 # ---------------------------------------------------------------------------
-# Debug-Logger
+# Debug-Logger (unverändert)
 # ---------------------------------------------------------------------------
 
 def log_debug_error(url, html, error, traceback_text, title=None):
@@ -202,6 +142,7 @@ def log_debug_error(url, html, error, traceback_text, title=None):
     guid = guid_match.group(1) if guid_match else "unknown"
 
     html_path = f"debug/html/{guid}.html"
+
     try:
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html or "")
@@ -222,6 +163,34 @@ def log_debug_error(url, html, error, traceback_text, title=None):
 
 
 # ---------------------------------------------------------------------------
+# Beschreibung → Roh-HTML extrahieren
+# ---------------------------------------------------------------------------
+
+def extract_raw_description(soup):
+    """
+    Holt den Hauptinhalt der Kursbeschreibung – ROHVERSION.
+    Keine Bereinigung, keine Manipulation.
+    """
+
+    primary_selectors = [
+        "div.VeranstaltungInhalt",
+        "div.VeranstaltungBeschreibung",
+        "section.veranstaltungInhalt",
+        "div.Text.Detail",
+        "main#content div.Text",
+    ]
+
+    for selector in primary_selectors:
+        node = soup.select_one(selector)
+        if node:
+            return node.decode_contents()
+
+    # Fallback: alles unter <main> oder <body>
+    fallback = soup.select_one("main, #content, body")
+    return fallback.decode_contents() if fallback else ""
+
+
+# ---------------------------------------------------------------------------
 # Parse-Safe Wrapper
 # ---------------------------------------------------------------------------
 
@@ -232,21 +201,23 @@ def parse_course_safe(url, debug=False):
             raise RuntimeError("Seite konnte nicht geladen werden")
 
         soup = BeautifulSoup(html, "html.parser")
-        title_tag = soup.find("h1")
-        pre_title = title_tag.get_text(strip=True) if title_tag else ""
+        title_tag = soup.find(["h1", "h2"])
+        pre_title = title_tag.get_text(strip=True) if title_tag else None
 
         return parse_course(url)
 
     except Exception as err:
         print(f"❌ Fehler beim Kurs: {url}")
         tb = traceback.format_exc()
+
         if debug:
             log_debug_error(url, html if "html" in locals() else None, err, tb, title=pre_title)
+
         return None
 
 
 # ---------------------------------------------------------------------------
-# Regulierer Parser
+# Regulierer Parser – Rohdaten
 # ---------------------------------------------------------------------------
 
 def parse_course(url):
@@ -260,10 +231,11 @@ def parse_course(url):
     guid_match = re.search(r"(cmx[0-9a-f]+)\.html", url, re.I)
     course["guid"] = guid_match.group(1) if guid_match else ""
 
-    title_tag = soup.find("h1")
+    title_tag = soup.find(["h1", "h2"])
     course["titel"] = title_tag.get_text(strip=True) if title_tag else "Ohne Titel"
 
-    course["beschreibung"] = collect_description(soup, title=course["titel"])
+    # ROH HTML – NICHT BEREINIGT
+    course["beschreibung"] = extract_raw_description(soup)
 
     img = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
     if img:
@@ -280,7 +252,6 @@ def parse_course(url):
 
     guid_ref = re.search(r"f_veranstaltung-(cmx[0-9a-f]+)", html)
     signup_guid = guid_ref.group(1) if guid_ref else course["guid"]
-
     course["link"] = (
         f"{BASE_URL}/Anmeldung/neueAnmeldung-true/f_veranstaltung-{signup_guid}"
         if signup_guid else ""
@@ -326,12 +297,12 @@ def iterate_courses(urls):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="VHS Kurs-Scraper")
-    p.add_argument("--debug", action="store_true",
-                   help="Speichert HTML & Fehlerlogs, bricht nie ab.")
-    p.add_argument("--output", default="kurse.json",
-                   help="Ziel-Datei (default: kurse.json)")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="VHS Kurs-Scraper (Rohdaten)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Speichert HTML & Fehlerlogs, bricht nie ab.")
+    parser.add_argument("--output", default="kurse.json",
+                        help="Ziel-Datei (default: kurse.json)")
+    return parser.parse_args()
 
 
 def main():
