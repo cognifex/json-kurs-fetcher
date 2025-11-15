@@ -57,7 +57,7 @@ def extract_course_links(html):
     return sorted(set(links))
 
 
-def clean_description_container(container):
+def clean_description_container(container, title=None):
     """Bereinigt HTML, behält aber Formatierung."""
     for tag in container.find_all(
         ["script", "style", "picture", "figure", "header", "footer"], recursive=True
@@ -70,31 +70,67 @@ def clean_description_container(container):
     for block in container.find_all(
         string=re.compile(r"\b(Zeiten|Preis|Nummer|Leitung|Ort|Bankverbindung)\b", re.I)
     ):
-        parent = block.find_parent(["div", "p", "li"]) or block.parent
+        parent = block.find_parent(["div", "p", "li", "tr", "table"])
+        if parent is None:
+            parent = block.parent
         if hasattr(parent, "decompose"):
             parent.decompose()
+
+    for table in container.find_all("table"):
+        classes = table.get("class", [])
+        if "layoutgrid" in classes or table.find("label"):
+            table.decompose()
+    for table in container.find_all("table"):
+        if not table.get_text(strip=True):
+            table.decompose()
+
+    if title:
+        normalized_title = re.sub(r"\s+", " ", title).strip().lower()
+        for heading in container.find_all(["h1", "h2"]):
+            heading_text = re.sub(r"\s+", " ", heading.get_text(strip=True)).lower()
+            if heading_text == normalized_title:
+                heading.decompose()
 
     html_text = container.decode_contents().strip()
     return re.sub(r"\s+\n", "\n", html_text)
 
 
-def collect_description(soup):
+def collect_description(soup, title=None):
     """Fasst relevante Inhaltsblöcke zusammen."""
-    selectors = [
+    primary_selectors = [
         "div.VeranstaltungInhalt",
         "div.VeranstaltungBeschreibung",
         "section.veranstaltungInhalt",
     ]
+    fallback_selectors = [
+        "div.Text.Detail",
+        "main#content div.Text",
+    ]
     sections = []
-    for selector in selectors:
-        sections.extend(soup.select(selector))
+    seen = set()
+    for selector in primary_selectors:
+        for node in soup.select(selector):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            sections.append(node)
+
+    if not sections:
+        for selector in fallback_selectors:
+            for node in soup.select(selector):
+                if id(node) in seen:
+                    continue
+                seen.add(id(node))
+                sections.append(node)
+            if sections:
+                break
 
     if not sections:
         return ""
 
     merged_html = "".join(section.decode_contents() for section in sections)
     wrapper = BeautifulSoup(f"<div>{merged_html}</div>", "html.parser")
-    return clean_description_container(wrapper.div)
+    return clean_description_container(wrapper.div, title=title)
 
 
 def split_off_next_label(text, current_label):
@@ -141,6 +177,10 @@ def extract_times(soup):
             text = re.sub(r"\s{2,}", " ", text)
             return text.strip()
 
+    table_value = find_labeled_value(soup, "Zeiten")
+    if table_value:
+        return table_value
+
     page_text = soup.get_text(" ", strip=True)
     match = re.search(r"(\d{1,2}\.\d{2}\.\d{4}.*?)(?=\b(?:Preis|Nummer|Leitung|Ort)\b|$)", page_text)
     return match.group(1).strip() if match else ""
@@ -161,7 +201,7 @@ def parse_course(url):
     title_tag = soup.find(["h1", "h2"])
     course["titel"] = title_tag.get_text(strip=True) if title_tag else "Ohne Titel"
 
-    course["beschreibung"] = collect_description(soup)
+    course["beschreibung"] = collect_description(soup, title=course["titel"])
 
     image_tag = soup.find("img", src=re.compile(r"/cmx/ordner/.cache/images/", re.I))
     if image_tag:
