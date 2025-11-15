@@ -359,7 +359,30 @@ def format_times_details(cell: Tag) -> Tuple[List[Dict[str, str]], Optional[str]
     return detail_items, header
 
 
-def build_times_detail_text(item: Dict[str, str]) -> str:
+def normalise_location(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return normalize_whitespace(value).rstrip(" .")
+
+
+def split_heading_parts(raw_heading: Optional[str]) -> Tuple[str, str]:
+    heading = normalize_whitespace(raw_heading or "")
+    if not heading:
+        return "Termine", ""
+
+    if "(" in heading and heading.endswith(")"):
+        open_idx = heading.find("(")
+        close_idx = heading.rfind(")")
+        if open_idx != -1 and close_idx > open_idx:
+            label = heading[:open_idx].strip()
+            badge = heading[open_idx + 1 : close_idx].strip()
+            if label:
+                return label, badge
+
+    return heading, ""
+
+
+def build_times_detail_text(item: Dict[str, str], course_location: str = "") -> str:
     date_text = item.get("date", "")
     time_text = item.get("time", "")
     parts: List[str] = []
@@ -368,7 +391,7 @@ def build_times_detail_text(item: Dict[str, str]) -> str:
     if time_text:
         parts.append(time_text)
     location_text = item.get("location")
-    if location_text:
+    if location_text and normalise_location(location_text) != normalise_location(course_location):
         parts.append(location_text)
     status_text = item.get("status")
     if status_text:
@@ -378,7 +401,12 @@ def build_times_detail_text(item: Dict[str, str]) -> str:
     return f"- {core_text}" if core_text else ""
 
 
-def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[str, str]], heading: Optional[str]) -> str:
+def build_times_html(
+    summary_lines: Sequence[str],
+    detail_items: Sequence[Dict[str, str]],
+    heading: Optional[str],
+    course_location: str = "",
+) -> str:
     if not summary_lines and not detail_items:
         return ""
 
@@ -398,9 +426,15 @@ def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[s
             container.append(summary_grid)
 
     if detail_items:
-        heading_text = heading or "Termine"
+        heading_label, heading_badge = split_heading_parts(heading)
         heading_tag = soup.new_tag("div", attrs={"class": "vhs-times-heading"})
-        heading_tag.string = heading_text
+        label_tag = soup.new_tag("span", attrs={"class": "vhs-times-heading-label"})
+        label_tag.string = heading_label
+        heading_tag.append(label_tag)
+        if heading_badge:
+            badge_tag = soup.new_tag("span", attrs={"class": "vhs-times-count"})
+            badge_tag.string = heading_badge
+            heading_tag.append(badge_tag)
         container.append(heading_tag)
 
         list_tag = soup.new_tag("ul", attrs={"class": "vhs-times-list"})
@@ -408,25 +442,23 @@ def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[s
         for detail in detail_items:
             list_item = soup.new_tag("li", attrs={"class": "vhs-times-list-item"})
 
-            def append_part(class_names, text: Optional[str]) -> None:
-                if not text:
-                    return
-                if list_item.contents:
-                    separator = soup.new_tag("span", attrs={"class": "vhs-times-separator", "aria-hidden": "true"})
-                    separator.string = "·"
-                    list_item.append(separator)
+            date_text = detail.get("date")
+            if date_text:
+                date_tag = soup.new_tag("span", attrs={"class": "vhs-times-date"})
+                date_tag.string = date_text
+                list_item.append(date_tag)
 
-                span = soup.new_tag("span")
-                if isinstance(class_names, str):
-                    span["class"] = [class_names]
-                else:
-                    span["class"] = list(class_names)
-                span.string = text
-                list_item.append(span)
+            time_text = detail.get("time")
+            if time_text:
+                time_tag = soup.new_tag("span", attrs={"class": "vhs-times-time"})
+                time_tag.string = time_text
+                list_item.append(time_tag)
 
-            append_part("vhs-times-date", detail.get("date"))
-            append_part("vhs-times-time", detail.get("time"))
-            append_part("vhs-times-location", detail.get("location"))
+            location_text = detail.get("location")
+            if location_text and normalise_location(location_text) != normalise_location(course_location):
+                location_tag = soup.new_tag("span", attrs={"class": "vhs-times-location"})
+                location_tag.string = location_text
+                list_item.append(location_tag)
 
             status_text = detail.get("status")
             if status_text:
@@ -436,7 +468,9 @@ def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[s
                     status_classes.append("vhs-times-status--cancelled")
                 elif "ausgebucht" in lowered or "belegt" in lowered:
                     status_classes.append("vhs-times-status--full")
-                append_part(status_classes, status_text)
+                status_tag = soup.new_tag("span", attrs={"class": status_classes})
+                status_tag.string = status_text
+                list_item.append(status_tag)
 
             if list_item.contents:
                 list_tag.append(list_item)
@@ -447,7 +481,7 @@ def build_times_html(summary_lines: Sequence[str], detail_items: Sequence[Dict[s
     return container.decode()
 
 
-def extract_times(soup: BeautifulSoup) -> Dict[str, str]:
+def extract_times(soup: BeautifulSoup, course_location: Optional[str] = None) -> Dict[str, str]:
     table = soup.select_one("table.layoutgrid")
     if not table:
         return {"text": "", "html": ""}
@@ -482,14 +516,26 @@ def extract_times(soup: BeautifulSoup) -> Dict[str, str]:
 
     if summary_lines:
         text_sections.append("\n".join(summary_lines))
+    course_location_value = normalize_whitespace(course_location or "")
+
     if detail_items:
-        detail_lines = [line for line in (build_times_detail_text(item) for item in detail_items) if line]
+        detail_lines = [
+            line
+            for line in (
+                build_times_detail_text(item, course_location_value)
+                for item in detail_items
+            )
+            if line
+        ]
         if detail_lines:
-            heading = header or "Termine"
-            text_sections.append(f"{heading}\n" + "\n".join(detail_lines))
+            heading_label, heading_badge = split_heading_parts(header)
+            heading_text = heading_label
+            if heading_badge:
+                heading_text = f"{heading_text} – {heading_badge}"
+            text_sections.append(f"{heading_text}\n" + "\n".join(detail_lines))
 
     text_value = "\n\n".join(section for section in text_sections if section).strip()
-    html_value = build_times_html(summary_lines, detail_items, header)
+    html_value = build_times_html(summary_lines, detail_items, header, course_location_value)
 
     return {"text": text_value, "html": html_value}
 
@@ -512,7 +558,7 @@ def process_course(course: dict) -> dict:
     course_copy["beschreibung_raw"] = raw_html
 
     soup = BeautifulSoup(raw_html, "html.parser") if raw_html else BeautifulSoup("", "html.parser")
-    times_payload = extract_times(soup)
+    times_payload = extract_times(soup, course.get("ort"))
     description = extract_description(soup, course.get("titel", ""))
 
     course_copy["beschreibung"] = description

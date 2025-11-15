@@ -567,7 +567,52 @@ function vhs_prettify_summary_line($line) {
     return preg_replace('/,\s+/', ' · ', $line);
 }
 
-function vhs_format_times_html($value) {
+function vhs_normalise_location($value) {
+    $value = trim((string) $value);
+    if ($value === '') {
+        return '';
+    }
+
+    return rtrim(preg_replace('/\s+/u', ' ', $value), ' .');
+}
+
+function vhs_split_heading_parts($heading) {
+    $heading = trim((string) $heading);
+    if ($heading === '') {
+        return ['Termine', ''];
+    }
+
+    $open = mb_strpos($heading, '(');
+    $close = mb_strrpos($heading, ')');
+    if ($open !== false && $close !== false && $close > $open) {
+        $label = trim(mb_substr($heading, 0, $open));
+        $badge = trim(mb_substr($heading, $open + 1, $close - $open - 1));
+        if ($label !== '') {
+            return [$label, $badge];
+        }
+    }
+
+    return [$heading, ''];
+}
+
+function vhs_detect_status_class($status_text) {
+    $status_text = trim(mb_strtolower((string) $status_text));
+    if ($status_text === '') {
+        return '';
+    }
+
+    if (mb_strpos($status_text, 'abgesagt') !== false) {
+        return 'vhs-times-status--cancelled';
+    }
+
+    if (mb_strpos($status_text, 'ausgebucht') !== false || mb_strpos($status_text, 'belegt') !== false) {
+        return 'vhs-times-status--full';
+    }
+
+    return '';
+}
+
+function vhs_format_times_html($value, $course_location = '') {
     [$summary, $heading, $details] = vhs_parse_times_value($value);
 
     if (empty($summary) && empty($details)) {
@@ -588,18 +633,70 @@ function vhs_format_times_html($value) {
         $html .= '</div>';
     }
 
-    if (!empty($heading)) {
-        $html .= '<div class="vhs-times-heading">' . esc_html($heading) . '</div>';
-    }
-
-    if (!empty($details)) {
+    $has_details = !empty($details);
+    if ($has_details) {
+        [$heading_label, $heading_badge] = vhs_split_heading_parts($heading);
+        $html .= '<div class="vhs-times-heading"><span class="vhs-times-heading-label">' . esc_html($heading_label) . '</span>';
+        if ($heading_badge !== '') {
+            $html .= '<span class="vhs-times-count">' . esc_html($heading_badge) . '</span>';
+        }
+        $html .= '</div>';
         $html .= '<ul class="vhs-times-list">';
         foreach ($details as $line) {
             $line = trim($line);
             if ($line === '') {
                 continue;
             }
-            $html .= '<li class="vhs-times-list-item"><span class="vhs-times-list-text">' . esc_html($line) . '</span></li>';
+            $segments = array_map('trim', explode('·', $line));
+            $date = '';
+            $time = '';
+            $status = '';
+            $location_parts = [];
+
+            foreach ($segments as $segment) {
+                if ($segment === '') {
+                    continue;
+                }
+
+                if ($date === '' && preg_match('/^(Mo|Di|Mi|Do|Fr|Sa|So)\s/i', $segment)) {
+                    $date = $segment;
+                    continue;
+                }
+
+                if ($time === '' && preg_match('/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/', $segment)) {
+                    $time = $segment;
+                    continue;
+                }
+
+                if ($status === '' && preg_match('/abgesagt|ausgebucht|belegt/i', $segment)) {
+                    $status = $segment;
+                    continue;
+                }
+
+                $location_parts[] = $segment;
+            }
+
+            $location = trim(implode(' · ', $location_parts));
+            if ($location !== '' && vhs_normalise_location($location) === vhs_normalise_location($course_location)) {
+                $location = '';
+            }
+
+            $html .= '<li class="vhs-times-list-item">';
+            if ($date !== '') {
+                $html .= '<span class="vhs-times-date">' . esc_html($date) . '</span>';
+            }
+            if ($time !== '') {
+                $html .= '<span class="vhs-times-time">' . esc_html($time) . '</span>';
+            }
+            if ($location !== '') {
+                $html .= '<span class="vhs-times-location">' . esc_html($location) . '</span>';
+            }
+            if ($status !== '') {
+                $class = vhs_detect_status_class($status);
+                $status_html = '<span class="vhs-times-status' . ($class !== '' ? ' ' . $class : '') . '">' . esc_html($status) . '</span>';
+                $html .= $status_html;
+            }
+            $html .= '</li>';
         }
         $html .= '</ul>';
     }
@@ -624,11 +721,16 @@ function vhs_render_field_markup($key, $label, $value) {
             }
         }
 
+        $course_location = '';
+        if (is_object($post) && isset($post->ID)) {
+            $course_location = get_post_meta($post->ID, 'vhs_ort', true);
+        }
+
         if ($html_meta !== '') {
             return '<div class="vhs-field vhs-field-times">' . $label_html . '<div class="vhs-times-content">' . $html_meta . '</div></div>';
         }
 
-        $formatted = vhs_format_times_html($value);
+        $formatted = vhs_format_times_html($value, $course_location);
         if ($formatted === '') {
             return '';
         }
@@ -659,29 +761,31 @@ add_action('wp_enqueue_scripts', function() {
     wp_register_style('vhs-kurse-style', false);
     wp_enqueue_style('vhs-kurse-style');
     wp_add_inline_style('vhs-kurse-style', "
-.vhs-field-box{background:var(--ct-background-light,#f8f9fa);border:1px solid rgba(0,0,0,0.07);border-radius:12px;padding:1.2rem 1.5rem;margin:1.5rem 0;box-shadow:0 1px 4px rgba(0,0,0,0.04);}
+.vhs-field-box{background:#fff;border:1px solid rgba(0,0,0,0.05);border-radius:12px;padding:1.2rem 1.5rem;margin:1.5rem 0;box-shadow:0 1px 4px rgba(0,0,0,0.04);}
 .vhs-field-box h3{font-size:1.1rem;margin-bottom:0.8rem;border-bottom:1px solid rgba(0,0,0,0.05);padding-bottom:0.4rem;}
 .vhs-field{margin:0.3rem 0;font-size:0.95rem;line-height:1.5;}
 .vhs-field strong{min-width:6.5rem;display:inline-block;font-weight:600;color:var(--ct-primary,#333);}
 .vhs-field-times{margin:0.9rem 0 0.8rem;}
 .vhs-field-times strong{display:block;margin-bottom:0.4rem;min-width:auto;}
-.vhs-times-content{display:flex;flex-direction:column;gap:0.75rem;}
-.vhs-times-summary-grid{display:flex;flex-wrap:wrap;gap:0.45rem;}
-.vhs-times-summary{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:0.45rem;}
-.vhs-times-summary li,.vhs-times-summary-item{display:inline-flex;align-items:center;gap:0.35rem;padding:0.35rem 0.7rem;border:1px solid rgba(0,0,0,0.08);border-radius:999px;background:#fff;font-size:0.88rem;line-height:1.4;}
-.vhs-times-heading{font-weight:600;color:var(--ct-primary,#333);font-size:0.9rem;}
-.vhs-times-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:0.45rem;}
-.vhs-times-list-item{display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem;padding:0.45rem 0.75rem;border:1px solid rgba(0,0,0,0.08);border-radius:12px;background:#fff;font-size:0.92rem;line-height:1.45;}
-.vhs-times-list-text{display:inline-flex;flex-wrap:wrap;gap:0.35rem;}
-.vhs-times-separator{color:rgba(0,0,0,0.35);}
+.vhs-times-content{display:flex;flex-direction:column;gap:0.9rem;}
+.vhs-times-summary-grid{display:flex;flex-wrap:wrap;gap:0.4rem;}
+.vhs-times-summary-item{display:inline-flex;align-items:center;padding:0.35rem 0.65rem;border:1px solid rgba(0,0,0,0.08);border-radius:999px;background:rgba(255,255,255,0.75);font-size:0.85rem;line-height:1.35;}
+.vhs-times-heading{display:flex;align-items:center;justify-content:space-between;gap:0.75rem;font-weight:600;color:var(--ct-primary,#333);font-size:0.9rem;}
+.vhs-times-heading-label{flex:1;}
+.vhs-times-count{padding:0.15rem 0.6rem;border-radius:999px;background:rgba(0,0,0,0.06);font-size:0.78rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:rgba(0,0,0,0.65);}
+.vhs-times-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;}
+.vhs-times-list-item{display:grid;grid-template-columns:minmax(7ch,auto) minmax(10ch,auto) 1fr auto;gap:0.6rem;align-items:center;padding:0.35rem 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:0.92rem;line-height:1.4;}
+.vhs-times-list-item:last-child{border-bottom:none;}
+.vhs-times-date,.vhs-times-time{white-space:nowrap;}
 .vhs-times-date{font-weight:600;color:var(--ct-primary,#333);}
 .vhs-times-time{font-variant-numeric:tabular-nums;}
-.vhs-times-location{color:rgba(0,0,0,0.7);}
-.vhs-times-status{padding:0.15rem 0.55rem;border-radius:999px;background:rgba(0,0,0,0.06);font-size:0.78rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:rgba(0,0,0,0.65);}
+.vhs-times-location{color:rgba(0,0,0,0.7);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.vhs-times-status{justify-self:end;padding:0.15rem 0.55rem;border-radius:999px;background:rgba(0,0,0,0.06);font-size:0.78rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:rgba(0,0,0,0.65);}
 .vhs-times-status--cancelled{background:rgba(220,53,69,0.14);color:#b02135;}
 .vhs-times-status--full{background:rgba(255,193,7,0.25);color:#8a6d00;}
 .vhs-button{display:inline-block;margin-top:1rem;background:var(--ct-primary,#0073aa);color:#fff;padding:0.6rem 1.2rem;border-radius:8px;text-decoration:none;font-weight:600;transition:all 0.2s ease-in-out;}
 .vhs-button:hover{background:var(--ct-primary-hover,#005b85);transform:translateY(-1px);}
+@media (max-width:600px){.vhs-times-list-item{grid-template-columns:repeat(2,minmax(0,1fr));row-gap:0.3rem;} .vhs-times-location{grid-column:1/-1;} .vhs-times-status{justify-self:start;}}
 ");
 });
 
