@@ -103,7 +103,45 @@ jobs:
           echo "Clean Script erfolgreich – Vorschau:"
           head -n 20 kurse.clean.json
 
-            # ----------------------------------------------------------------------
+      # ----------------------------------------------------------------------
+      # TIMESTAMP IN JSON-DATEIEN SCHREIBEN
+      # ----------------------------------------------------------------------
+      - name: Füge Timestamp in JSON-Dateien ein
+        run: |
+          TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "Füge Timestamp $TS in kurse.json und kurse.clean.json ein..."
+          python - "$TS" << 'EOF'
+          import json
+          import sys
+          from pathlib import Path
+
+          ts = sys.argv[1]
+
+          for fname in ("kurse.json", "kurse.clean.json"):
+              p = Path(fname)
+              if not p.exists():
+                  print(f"Warnung: {fname} existiert nicht, überspringe.")
+                  continue
+
+              with p.open("r", encoding="utf-8") as f:
+                  data = json.load(f)
+
+              if isinstance(data, dict):
+                  # Timestamp als Feld hinzufügen (am "Anfang" im Sinne der Struktur)
+                  data["_generated_at"] = ts
+              else:
+                  # Falls die Wurzel ein Array o.ä. ist, wrappe es in ein Objekt
+                  data = {
+                      "_generated_at": ts,
+                      "data": data,
+                  }
+
+              with p.open("w", encoding="utf-8") as f:
+                  json.dump(data, f, ensure_ascii=False, indent=2)
+                  f.write("\n")
+          EOF
+
+      # ----------------------------------------------------------------------
       # COMMIT & PUSH (korrekt)
       # ----------------------------------------------------------------------
       - name: Commit & Push results
@@ -127,4 +165,3 @@ jobs:
           git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
 
           exit 0
-
