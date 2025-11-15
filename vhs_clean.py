@@ -1,113 +1,242 @@
-from bs4 import BeautifulSoup, NavigableString, Tag
+import argparse
+import json
 import re
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
 
-def clean_html_v2(raw_html: str) -> str:
-    soup = BeautifulSoup(raw_html, "html.parser")
+from bs4 import BeautifulSoup, Tag
 
-    # ---------------------------------------------------------
-    # 1) Entferne technisch unnötige Elemente
-    # ---------------------------------------------------------
-    for tag in soup(["script", "style", "picture", "figure", "img", "svg", "header", "footer"]):
+
+ADMIN_KEYWORDS = {
+    "iban",
+    "bic",
+    "bankverbindung",
+    "name der bank",
+    "kontoinhaber",
+    "zahlungsbedingungen",
+    "teilnahmebedingungen",
+    "gebührenordnung",
+    "rücktritt",
+    "haftung",
+    "datenschutz",
+    "zahlung",
+}
+
+
+def normalize_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def iter_stripped_strings(node: Tag) -> Iterable[str]:
+    for chunk in node.stripped_strings:
+        text = normalize_whitespace(chunk)
+        if text:
+            yield text
+
+
+def format_times_summary(cell: Tag) -> List[str]:
+    return list(iter_stripped_strings(cell))
+
+
+def format_times_details(cell: Tag) -> Tuple[List[str], Optional[str]]:
+    header: Optional[str] = None
+    summary_tag = cell.find("summary")
+    if summary_tag:
+        summary_text = normalize_whitespace(" ".join(summary_tag.stripped_strings))
+        if summary_text:
+            header = f"Termine ({summary_text})"
+
+    detail_lines: List[str] = []
+    table = cell.find("table")
+    if not table:
+        return detail_lines, header
+
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if not cells:
+            continue
+
+        date_text = ""
+        time_text = ""
+        status_text = ""
+        primary_parts = list(iter_stripped_strings(cells[0]))
+        if primary_parts:
+            date_text = primary_parts[0]
+        if len(primary_parts) >= 2:
+            time_text = primary_parts[1]
+        if len(primary_parts) >= 3:
+            status_text = primary_parts[2]
+
+        location_text = ""
+        if len(cells) > 1:
+            location_text = " ".join(iter_stripped_strings(cells[1]))
+
+        line_parts: List[str] = []
+        if date_text and time_text:
+            line_parts.append(f"{date_text}, {time_text}")
+        elif date_text:
+            line_parts.append(date_text)
+        elif time_text:
+            line_parts.append(time_text)
+
+        extra_parts: List[str] = []
+        if status_text:
+            extra_parts.append(status_text)
+        if location_text:
+            extra_parts.append(location_text)
+
+        core_text = line_parts[0] if line_parts else ""
+        if extra_parts:
+            joiner = " – ".join(extra_parts)
+            core_text = f"{core_text} – {joiner}" if core_text else joiner
+
+        if core_text:
+            detail_lines.append(f"- {core_text}")
+
+    return detail_lines, header
+
+
+def extract_times(soup: BeautifulSoup) -> str:
+    table = soup.select_one("table.layoutgrid")
+    if not table:
+        return ""
+
+    summary_lines: List[str] = []
+    detail_lines: List[str] = []
+    header: Optional[str] = None
+
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
+        label_tag = cells[0].find("label")
+        if not label_tag:
+            continue
+        label = normalize_whitespace(label_tag.get_text())
+        value_cell = cells[1]
+        key = label.lower()
+
+        if key == "zeiten":
+            summary_lines.extend(format_times_summary(value_cell))
+        elif key in {"anzahl", "termine"}:
+            details, candidate_header = format_times_details(value_cell)
+            detail_lines.extend(details)
+            if candidate_header and not header:
+                header = candidate_header
+
+    table.decompose()
+
+    sections: List[str] = []
+    if summary_lines:
+        sections.append("\n".join(summary_lines))
+    if detail_lines:
+        heading = header or "Termine"
+        sections.append(f"{heading}\n" + "\n".join(detail_lines))
+
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def remove_admin_lines(lines: Sequence[str]) -> List[str]:
+    result: List[str] = []
+    for line in lines:
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in ADMIN_KEYWORDS):
+            continue
+        if not result or result[-1] != line:
+            result.append(line)
+    return result
+
+
+def join_paragraphs(lines: Sequence[str]) -> str:
+    paragraphs: List[str] = []
+    index = 0
+    length = len(lines)
+    while index < length:
+        line = lines[index]
+        if line.startswith("- "):
+            bullet_block: List[str] = []
+            while index < length and lines[index].startswith("- "):
+                bullet_block.append(lines[index])
+                index += 1
+            paragraphs.append("\n".join(bullet_block))
+        else:
+            paragraphs.append(line)
+            index += 1
+    return "\n\n".join(paragraphs).strip()
+
+
+def extract_description(soup: BeautifulSoup, title: str) -> str:
+    for tag in soup.find_all(["script", "style", "picture", "figure", "img", "svg", "header", "footer"]):
         tag.decompose()
 
-    # CMX-footer Tabellen loswerden
-    for table in soup.find_all("table"):
-        table.decompose()
+    for li in soup.find_all("li"):
+        bullet_text = normalize_whitespace(" ".join(li.stripped_strings))
+        li.clear()
+        if bullet_text:
+            li.append(f"- {bullet_text}")
+    for container in soup.find_all(["ul", "ol"]):
+        container.unwrap()
 
-    # ---------------------------------------------------------
-    # 2) Entferne gesamte CMX-Basisdaten-Blöcke
-    #    (oft Bootstrap-Grids: col-sm-3, col-xs-6 etc.)
-    # ---------------------------------------------------------
-    def is_cmx_basis_block(tag):
-        classes = tag.get("class", [])
-        if not classes:
-            return False
-        return any(c.startswith("col-") for c in classes)
-
-    for div in soup.find_all(is_cmx_basis_block):
-        div.decompose()
-
-    # ---------------------------------------------------------
-    # 3) Entferne typische Verwaltungsinhalte
-    # ---------------------------------------------------------
-    admin_keywords = [
-        "iban", "bic", "bankverbindung", "zahlungsbedingungen",
-        "teilnahmebedingungen", "gebührenordnung",
-        "rücktritt", "haftung", "datenschutz", "zahlung",
-        "preis:", "kosten:", "ort:", "zeit:", "leitung:",
-        "anzahl termine", "termine:"
-    ]
-
-    for el in soup.find_all(["p", "div", "span"]):
-        t = el.get_text(" ", strip=True).lower()
-        if any(kw in t for kw in admin_keywords):
-            el.decompose()
-
-    # ---------------------------------------------------------
-    # 4) Entferne zusätzlichen Footer-Müll nach letztem <h3>
-    # ---------------------------------------------------------
-    footer_keywords = ["bankverbindung", "iban", "bic", "datenschutz", "haftung"]
-
-    text_lower = soup.get_text(" ").lower()
-    if any(kw in text_lower for kw in footer_keywords):
-        last_h3 = soup.find_all("h3")
-        if last_h3:
-            for sib in last_h3[-1].find_all_next():
-                sib.decompose()
-
-    # ---------------------------------------------------------
-    # 5) span-Wrapper entfernen
-    # ---------------------------------------------------------
-    for span in soup.find_all("span"):
-        span.unwrap()
-
-    # ---------------------------------------------------------
-    # 6) Überflüssige DIVs in <p> verwandeln
-    # ---------------------------------------------------------
-    for div in soup.find_all("div"):
-        if len(div.find_all(["p", "ul", "ol", "h1", "h2", "h3"])) == 0:
-            div.name = "p"
-
-    # ---------------------------------------------------------
-    # 7) Leere Tags löschen
-    # ---------------------------------------------------------
-    for tag in soup.find_all():
-        if tag.name not in ["br"] and not tag.get_text(strip=True):
-            tag.decompose()
-
-    # ---------------------------------------------------------
-    # 8) <br><br>-Cluster → neuer Absatz
-    # ---------------------------------------------------------
     for br in soup.find_all("br"):
-        nxt = br.next_sibling
-        if isinstance(nxt, Tag) and nxt.name == "br":
-            p = soup.new_tag("p")
-            br.replace_with(p)
-            nxt.decompose()
+        br.replace_with("\n")
 
-    # ---------------------------------------------------------
-    # 9) Duplicate Titelzeilen entfernen
-    # ---------------------------------------------------------
-    h_tags = soup.find_all(["h1", "h2", "h3"])
-    if len(h_tags) >= 2:
-        if h_tags[0].get_text(strip=True) == h_tags[1].get_text(strip=True):
-            h_tags[1].decompose()
+    text = soup.get_text("\n")
+    raw_lines = [normalize_whitespace(line) for line in text.splitlines()]
+    lines = [line for line in raw_lines if line]
+    lines = remove_admin_lines(lines)
 
-    # ---------------------------------------------------------
-    # 10) Whitespace normalisieren
-    # ---------------------------------------------------------
-    def normalize_text(node):
-        if isinstance(node, NavigableString):
-            return NavigableString(re.sub(r"\s+", " ", str(node)))
-        return node
+    title = title.strip()
+    if title:
+        if not lines or lines[0].lower() != title.lower():
+            lines.insert(0, title)
 
-    for element in soup.find_all(text=True):
-        element.replace_with(normalize_text(element))
+    return join_paragraphs(lines)
 
-    # ---------------------------------------------------------
-    # 11) Finale Ausgabe
-    # ---------------------------------------------------------
-    clean_html = soup.prettify()
-    clean_html = re.sub(r'\n\s*\n', '\n\n', clean_html)
 
-    return clean_html.strip()
+def process_course(course: dict) -> dict:
+    course_copy = dict(course)
+    raw_html = course.get("beschreibung") or ""
+    course_copy["beschreibung_raw"] = raw_html
+
+    soup = BeautifulSoup(raw_html, "html.parser") if raw_html else BeautifulSoup("", "html.parser")
+    times_text = extract_times(soup)
+    description = extract_description(soup, course.get("titel", ""))
+
+    course_copy["beschreibung"] = description
+    if times_text:
+        course_copy["zeiten"] = times_text
+    else:
+        course_copy["zeiten"] = normalize_whitespace(course.get("zeiten", ""))
+
+    return course_copy
+
+
+def transform_payload(payload) -> dict:
+    if isinstance(payload, dict):
+        courses = payload.get("data", [])
+    else:
+        courses = payload
+
+    processed_courses = [process_course(course) for course in courses or []]
+
+    if isinstance(payload, dict):
+        result = {k: v for k, v in payload.items() if k != "data"}
+        result["data"] = processed_courses
+        return result
+    return {"data": processed_courses}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Bereinigt Kurseinträge aus dem Scraper-Export.")
+    parser.add_argument("input", type=Path, help="Pfad zur Eingabedatei (kurse.json)")
+    parser.add_argument("output", type=Path, help="Pfad zur Ausgabedatei (kurse.clean.json)")
+    args = parser.parse_args()
+
+    payload = json.loads(args.input.read_text(encoding="utf-8"))
+    result = transform_payload(payload)
+
+    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
