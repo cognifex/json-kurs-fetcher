@@ -1,5 +1,3 @@
-# json-kurs-fetcher
-
 Ein Service zum Erstellen von JSON-Dateien aus VHS-Kursen.
 
 ## Lokale Ausführung
