@@ -3,7 +3,7 @@
  * Plugin Name: VHS-Kurse Importer Extended
  * Description: Importiert und synchronisiert Kursdaten aus einer JSON-Datei. Erstellt und aktualisiert automatisch Kurse, setzt Beitragsbilder (mit sicherem Download), deaktiviert nicht mehr vorhandene Kurse und zeigt automatisch einen „Jetzt anmelden“-Button im Widget an.
  * Version: 1.5
- * Author: Tim Heimes / Cognifaktur
+ * Author: <AUTOR_NAME> / <ORGANISATION>
  */
 
 if (!defined('ABSPATH')) exit;

@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup, Tag
 BASE_URL = "https://vhs-lahnstein.de"
 
 OVERVIEW_URLS = [
-    "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=Tim+Heimes"
+    "https://vhs-lahnstein.de/Suche?cmxelementid=web4e15b88472a73&seite=Suche&Suche=1&Suchbegriffe=<SUCHBEGRIFF_PLATZHALTER>"
     "&Vormittag=1&Nachmittag=1&Abend=1&Montag=1&Dienstag=1&Mittwoch=1&Donnerstag=1&Freitag=1&Samstag=1&Sonntag=1",
 ]
 
